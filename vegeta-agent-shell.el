@@ -243,14 +243,21 @@ and open the raw transcript file instead."
           (vegeta--pop-to buf)))))))
 
 (defun vegeta--agent-shell-prefill-orphan-prompt (buffer transcript-path)
-  "Insert `vegeta-agent-shell-orphan-prompt' at the input point of BUFFER.
-TRANSCRIPT-PATH is spliced into the template.  Does not send the prompt
-— the user reviews and presses RET."
+  "Insert `vegeta-agent-shell-orphan-prompt' into BUFFER via agent-shell.
+Uses `agent-shell-insert', which is aware of shell-maker's read-only
+regions and defers via the `prompt-ready' event when the shell is still
+initializing.  Falls back to the kill-ring if the insertion signals
+so the user can still paste the prompt manually."
   (when (buffer-live-p buffer)
-    (with-current-buffer buffer
-      (goto-char (point-max))
-      (insert (format vegeta-agent-shell-orphan-prompt
-                      transcript-path)))))
+    (let ((text (format vegeta-agent-shell-orphan-prompt transcript-path)))
+      (condition-case err
+          (with-current-buffer buffer
+            (agent-shell-insert :text text :no-focus t
+                                :shell-buffer buffer))
+        (error
+         (kill-new text)
+         (message "vegeta: couldn't prefill (%s); prompt copied to kill-ring"
+                  (error-message-string err)))))))
 
 ;;; Date key
 
