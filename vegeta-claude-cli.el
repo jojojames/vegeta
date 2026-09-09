@@ -193,6 +193,7 @@ first response."
                     (or (null preview) (null cwd) (null timestamp)
                         (null ai-title)))
           (let ((line-end (line-end-position))
+                (line-start (point))
                 obj)
             (setq obj
                   (condition-case _
@@ -240,8 +241,14 @@ first response."
                                   (string-prefix-p "<local-command-stderr>"
                                                    trimmed))
                         (setq preview
-                              (car (split-string trimmed "\n" t))))))))
-            (forward-line 1)))))
+                              (car (split-string trimmed "\n" t)))))))))
+            ;; Always advance, even when the line failed to parse (a
+            ;; truncated line at the read boundary yields `obj' = nil).
+            ;; Break out if `forward-line' can't move — e.g. at eob or
+            ;; a last line with no newline — so we never loop forever.
+            (forward-line 1)
+            (when (= (point) line-start)
+              (goto-char (point-max)))))))
     (list :agent "Claude"
           :model model
           :started-at timestamp
@@ -250,7 +257,7 @@ first response."
           :session-id session-id
           :first-prompt preview
           :ai-title ai-title
-          :renamed nil))))
+          :renamed nil)))
 
 ;;; Provider: :visit
 
