@@ -41,6 +41,13 @@
   "Name of the sidebar buffer."
   :type 'string)
 
+(defcustom vegeta-buffer-name "*vegeta*"
+  "Name of the buffer used by `\\[vegeta]' (non-sidebar view).
+Kept separate from `vegeta-name' so the sidebar and the full-frame
+browser can coexist without stepping on each other's window
+properties (dedicated flag, `window-size-fixed', etc.)."
+  :type 'string)
+
 (defcustom vegeta-width 55
   "Width of the sidebar window."
   :type 'integer)
@@ -1223,13 +1230,19 @@ in-process idle-timer parser."
   "Non-nil if the sidebar is visible in the selected frame."
   (vegeta--sidebar-window))
 
-(defun vegeta--get-or-create-buffer ()
-  "Return the sidebar buffer, creating and initializing it if needed."
-  (let ((existing (get-buffer vegeta-name)))
+(defun vegeta--get-or-create-buffer (&optional name fixed)
+  "Return a vegeta buffer, creating and initializing it if needed.
+NAME defaults to `vegeta-name' (the sidebar buffer).  FIXED overrides
+`window-size-fixed' in the newly-created buffer — pass nil to allow
+free resizing (useful for the full-frame view), or a symbol like
+`width' to keep the sidebar's fixed sizing."
+  (let* ((name (or name vegeta-name))
+         (existing (get-buffer name)))
     (or existing
-        (let ((buf (generate-new-buffer vegeta-name)))
+        (let ((buf (generate-new-buffer name)))
           (with-current-buffer buf
             (vegeta-mode)
+            (setq-local window-size-fixed fixed)
             (vegeta-refresh))
           buf))))
 
@@ -1245,10 +1258,25 @@ in-process idle-timer parser."
         (enlarge-window-horizontally (- w (window-width))))))))
 
 ;;;###autoload
+(defun vegeta ()
+  "Open the agent chat browser in the current window.
+Unlike `vegeta-show-sidebar', which docks the browser in a
+narrow side-window, this fills the current window with the browser
+buffer — handy for a full-frame view where the tree, dates, and
+titles all get room to breathe.
+
+Uses a separate buffer (`vegeta-buffer-name') from the sidebar, so
+the two can coexist.  Both share the same on-disk cache and provider
+registry, so parsing done in one is immediately visible in the other."
+  (interactive)
+  (switch-to-buffer
+   (vegeta--get-or-create-buffer vegeta-buffer-name nil)))
+
+;;;###autoload
 (defun vegeta-show-sidebar ()
   "Show the agent chat sidebar."
   (interactive)
-  (let ((buffer (vegeta--get-or-create-buffer)))
+  (let ((buffer (vegeta--get-or-create-buffer vegeta-name vegeta-window-fixed)))
     (display-buffer-in-side-window buffer vegeta-display-alist)
     (let ((window (get-buffer-window buffer)))
       (when window
