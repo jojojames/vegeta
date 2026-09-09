@@ -70,12 +70,26 @@
 (defcustom vegeta-parse-chunk-size 10
   "Number of entry headers to parse per idle tick.
 Smaller values yield more often to user input; larger values finish
-the background scan sooner at the cost of interactivity."
+the background scan sooner at the cost of interactivity.
+Only used by the fallback in-process parser; `vegeta-async-workers'
+controls the batch size when async parsing is active."
   :type 'integer)
 
 (defcustom vegeta-parse-idle-delay 0.3
-  "Idle delay in seconds between parse chunks."
+  "Idle delay in seconds between parse chunks.
+Only used by the fallback in-process parser."
   :type 'number)
+
+(defcustom vegeta-async-workers 4
+  "Number of parallel subprocess workers for metadata parsing.
+When the `async' library is installed, `vegeta-refresh' splits the
+parse queue into this many roughly-equal batches and dispatches each
+to its own Emacs subprocess.  Each finished batch merges into the
+in-memory cache and triggers a redraw; the main Emacs stays fully
+responsive throughout.  Set to 0 or nil to force the fallback
+in-process idle-timer parser."
+  :type '(choice (const :tag "Disabled (in-process only)" nil)
+                 integer))
 
 (defcustom vegeta-open-file-in-most-recently-used-window t
   "Whether visited chats open in the MRU window."
@@ -205,6 +219,12 @@ Used for O(1) duplicate suppression when queuing.")
   "Discovery result cached across `vegeta--redraw' calls.
 Cleared by `vegeta-refresh' so background parse ticks don't
 re-scan the filesystem on every chunk.")
+
+(defvar vegeta--async-pending 0
+  "Number of async worker batches still in flight.
+When it hits zero after a refresh, the persisted cache flushes to disk.")
+
+(declare-function async-start "async")
 
 (defvar-local vegeta--marks nil
   "Hash table mapping entry id -> mark symbol (e.g. `delete').")
@@ -491,6 +511,96 @@ for seconds on a several-hundred-entry initial scan."
           (run-with-idle-timer
            vegeta-parse-idle-delay t
            #'vegeta--parse-tick))))
+
+;;; Async parsing (subprocess workers)
+
+(defun vegeta--async-available-p ()
+  "Return non-nil when async parsing is both configured and installed."
+  (and vegeta-async-workers
+       (> vegeta-async-workers 0)
+       (require 'async nil t)))
+
+(defun vegeta--split-list (lst n)
+  "Split LST into at most N roughly equal chunks.
+Returns fewer chunks when LST has fewer elements than N."
+  (let* ((len (length lst))
+         (chunk (max 1 (ceiling (/ (float len) (max 1 n)))))
+         result)
+    (while lst
+      (push (seq-take lst chunk) result)
+      (setq lst (nthcdr chunk lst)))
+    (nreverse result)))
+
+(defun vegeta--redraw-all-sidebars ()
+  "Redraw every live vegeta sidebar buffer."
+  (dolist (buf (buffer-list))
+    (when (buffer-live-p buf)
+      (with-current-buffer buf
+        (when (derived-mode-p 'vegeta-mode)
+          (vegeta--redraw))))))
+
+(defun vegeta--async-worker-form (batch lib-dir)
+  "Return the lambda form the async worker should evaluate.
+BATCH is the entry list to parse; LIB-DIR is the directory containing
+`vegeta-core.el' so the worker can add it to its load-path."
+  `(lambda ()
+     ;; The worker inherits none of the parent's state.  Load just
+     ;; enough of vegeta to register providers and reach the parsers;
+     ;; we deliberately avoid `package-initialize' since parsing needs
+     ;; no ELPA packages (agent-shell is lazy-required by :visit).
+     (setq load-path (cons ,lib-dir load-path))
+     (require 'vegeta-core)
+     (require 'vegeta-claude-cli)
+     (require 'vegeta-agent-shell)
+     (mapcar
+      (lambda (entry)
+        (let* ((prov (alist-get (plist-get entry :provider)
+                                vegeta-providers))
+               (parser (plist-get prov :parse)))
+          ;; Return a compact tuple; the caller writes it into
+          ;; `vegeta--parse-cache' with the current schema version.
+          (list (plist-get entry :id)
+                (plist-get entry :mtime)
+                (and parser (funcall parser entry)))))
+      ',batch)))
+
+(defun vegeta--async-callback (results)
+  "Merge RESULTS from an async worker into the cache, then redraw."
+  (dolist (row results)
+    (let ((id (nth 0 row))
+          (mtime (nth 1 row))
+          (meta (nth 2 row)))
+      (puthash id (list :schema vegeta--cache-schema
+                        :mtime mtime
+                        :meta meta)
+               vegeta--parse-cache)))
+  (setq vegeta--cache-dirty t)
+  (setq vegeta--async-pending (max 0 (1- vegeta--async-pending)))
+  (vegeta--redraw-all-sidebars)
+  (when (zerop vegeta--async-pending)
+    ;; Arm the flush timer so the just-parsed batch persists.
+    (unless (timerp vegeta--cache-flush-timer)
+      (setq vegeta--cache-flush-timer
+            (run-with-idle-timer
+             vegeta-cache-flush-idle-delay t
+             #'vegeta--cache-flush-tick)))))
+
+(defun vegeta--dispatch-async-batch (batch lib-dir)
+  "Fire a single async worker for BATCH; results merge back on completion."
+  (cl-incf vegeta--async-pending)
+  (async-start (vegeta--async-worker-form batch lib-dir)
+               #'vegeta--async-callback))
+
+(defun vegeta--start-async-parse ()
+  "Dispatch the current parse queue across `vegeta-async-workers'."
+  (let* ((queue vegeta--parse-queue)
+         (lib-dir (file-name-directory (or (locate-library "vegeta-core")
+                                           (error "vegeta-core.el not on load-path")))))
+    (setq vegeta--parse-queue nil)
+    (clrhash vegeta--parse-queued-ids)
+    (dolist (batch (vegeta--split-list queue vegeta-async-workers))
+      (when batch
+        (vegeta--dispatch-async-batch batch lib-dir)))))
 
 (defun vegeta--parse-tick ()
   "Parse the next chunk of entries, then redraw affected sidebars.
@@ -1080,7 +1190,10 @@ the override so the row falls back to `:ai-title' or `:first-prompt'."
   "Rescan providers and redraw.
 On the first invocation of an Emacs session, the persisted cache from
 `vegeta-cache-file' is loaded before the scan so entries with fresh
-cached metadata render immediately."
+cached metadata render immediately.  Uncached entries are parsed in
+subprocess workers when the `async' library is installed and
+`vegeta-async-workers' > 0; otherwise they fall through to the
+in-process idle-timer parser."
   (interactive)
   (unless vegeta--cache-loaded
     (vegeta--cache-load))
@@ -1090,7 +1203,11 @@ cached metadata render immediately."
   (let ((entries (vegeta--all-entries)))
     (vegeta--queue-uncached entries)
     (vegeta--redraw)
-    (vegeta--start-parse-timer)))
+    (cond
+     ((and vegeta--parse-queue (vegeta--async-available-p))
+      (vegeta--start-async-parse))
+     (vegeta--parse-queue
+      (vegeta--start-parse-timer)))))
 
 ;;; Sidebar window commands
 

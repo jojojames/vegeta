@@ -22,7 +22,17 @@
 (require 'seq)
 (require 'subr-x)
 
-(require 'agent-shell)
+;; agent-shell is loaded lazily inside `vegeta--agent-shell-visit'.
+;; Keeping it out of the top-level requires means this file can be
+;; loaded in a minimal Emacs (e.g. an `async' worker) that has no
+;; agent-shell installed — the parser doesn't need it, only visit.
+(declare-function agent-shell-insert "agent-shell")
+(declare-function agent-shell-buffers "agent-shell")
+(declare-function agent-shell-select-config "agent-shell")
+(declare-function agent-shell--start "agent-shell")
+(declare-function agent-shell--auto-preferred-config "agent-shell")
+(declare-function agent-shell--resolved-agent-configs "agent-shell")
+(defvar agent-shell--state)
 
 (require 'vegeta-core)
 (require 'vegeta-claude-cli)
@@ -201,6 +211,7 @@ user still has to press RET to send the prefilled prompt.
 
 Use \\[universal-argument] before RET on the row to bypass this entirely
 and open the raw transcript file instead."
+  (require 'agent-shell)
   (let* ((meta (vegeta--ensure-parsed entry))
          (agent-name (plist-get meta :agent))
          (cwd (plist-get meta :cwd))
