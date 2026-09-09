@@ -67,11 +67,13 @@
                  (const :tag "Fixed width" width)
                  (const :tag "Fixed height" height)))
 
-(defcustom vegeta-parse-chunk-size 30
-  "Number of entry headers to parse per idle tick."
+(defcustom vegeta-parse-chunk-size 10
+  "Number of entry headers to parse per idle tick.
+Smaller values yield more often to user input; larger values finish
+the background scan sooner at the cost of interactivity."
   :type 'integer)
 
-(defcustom vegeta-parse-idle-delay 0.1
+(defcustom vegeta-parse-idle-delay 0.3
   "Idle delay in seconds between parse chunks."
   :type 'number)
 
@@ -194,6 +196,15 @@ in that order of priority.")
 
 (defvar vegeta--parse-queue nil
   "List of entries awaiting metadata parse.")
+
+(defvar vegeta--parse-queued-ids (make-hash-table :test 'equal)
+  "Hash set of entry ids currently on `vegeta--parse-queue'.
+Used for O(1) duplicate suppression when queuing.")
+
+(defvar vegeta--entries-cache nil
+  "Discovery result cached across `vegeta--redraw' calls.
+Cleared by `vegeta-refresh' so background parse ticks don't
+re-scan the filesystem on every chunk.")
 
 (defvar-local vegeta--marks nil
   "Hash table mapping entry id -> mark symbol (e.g. `delete').")
@@ -461,12 +472,16 @@ skipped so parser changes invalidate stale data automatically."
 ;;; Async parse loop
 
 (defun vegeta--queue-uncached (entries)
-  "Push ENTRIES lacking a fresh cache entry onto the parse queue."
+  "Push ENTRIES lacking a fresh cache entry onto the parse queue.
+O(n) via a hash-set of queued ids — the previous implementation used
+`member' + `nconc' which was O(n^2) in queue length and stalled Emacs
+for seconds on a several-hundred-entry initial scan."
   (dolist (e entries)
-    (unless (vegeta--cached-meta e)
-      (unless (member e vegeta--parse-queue)
-        (setq vegeta--parse-queue
-              (nconc vegeta--parse-queue (list e)))))))
+    (let ((id (plist-get e :id)))
+      (unless (or (vegeta--cached-meta e)
+                  (gethash id vegeta--parse-queued-ids))
+        (puthash id t vegeta--parse-queued-ids)
+        (push e vegeta--parse-queue)))))
 
 (defun vegeta--start-parse-timer ()
   "Kick off the idle timer if there is work to do and it's not running."
@@ -478,21 +493,35 @@ skipped so parser changes invalidate stale data automatically."
            #'vegeta--parse-tick))))
 
 (defun vegeta--parse-tick ()
-  "Parse the next chunk of entries, then redraw affected sidebars."
-  (let ((n 0) (parsed nil))
-    (while (and vegeta--parse-queue
-                (< n vegeta-parse-chunk-size))
-      (let ((entry (pop vegeta--parse-queue)))
-        (vegeta--ensure-parsed entry)
-        (push entry parsed))
-      (cl-incf n))
-    (when parsed
-      (dolist (buf (buffer-list))
-        (when (and (buffer-live-p buf)
-                   (eq (buffer-local-value 'major-mode buf)
-                       'vegeta-mode))
-          (with-current-buffer buf
-            (vegeta--redraw)))))
+  "Parse the next chunk of entries, then redraw affected sidebars.
+Wrapped in `while-no-input' so user input aborts the tick cleanly —
+whatever entries were parsed before the abort stay cached, and the
+next idle tick continues where we left off.  Any entry popped from
+the queue but not parsed due to an abort gets requeued."
+  (let ((aborted
+         (while-no-input
+           (let ((n 0) (parsed nil))
+             (while (and vegeta--parse-queue
+                         (< n vegeta-parse-chunk-size)
+                         (not (input-pending-p)))
+               (let* ((entry (pop vegeta--parse-queue))
+                      (id (plist-get entry :id)))
+                 (remhash id vegeta--parse-queued-ids)
+                 (vegeta--ensure-parsed entry)
+                 (push entry parsed))
+               (cl-incf n))
+             (when parsed
+               (dolist (buf (buffer-list))
+                 (when (and (buffer-live-p buf)
+                            (eq (buffer-local-value 'major-mode buf)
+                                'vegeta-mode))
+                   (with-current-buffer buf
+                     (vegeta--redraw)))))
+             nil))))
+    ;; `while-no-input' returns `t' on abort — nothing to do beyond
+    ;; noting that some entries may have been popped but not parsed;
+    ;; they'll be re-queued by the next `vegeta-refresh'.
+    (ignore aborted)
     (unless vegeta--parse-queue
       (when (timerp vegeta--parse-timer)
         (cancel-timer vegeta--parse-timer))
@@ -501,13 +530,18 @@ skipped so parser changes invalidate stale data automatically."
 ;;; Discovery aggregation
 
 (defun vegeta--all-entries ()
-  "Return a flat list of entries from every enabled provider."
-  (let (all)
-    (dolist (p (vegeta--enabled-providers))
-      (let ((lister (plist-get p :list)))
-        (when lister
-          (setq all (append all (funcall lister))))))
-    all))
+  "Return a flat list of entries from every enabled provider.
+Result is cached in `vegeta--entries-cache' until the next
+`vegeta-refresh' clears it.  Background parse ticks trigger redraws
+that call this repeatedly; without the cache each tick would re-scan
+every project's transcripts directory and every Claude project dir."
+  (or vegeta--entries-cache
+      (let (all)
+        (dolist (p (vegeta--enabled-providers))
+          (let ((lister (plist-get p :list)))
+            (when lister
+              (setq all (append all (funcall lister))))))
+        (setq vegeta--entries-cache all))))
 
 ;;; Entry accessors (consult cache when available)
 
@@ -1050,6 +1084,9 @@ cached metadata render immediately."
   (interactive)
   (unless vegeta--cache-loaded
     (vegeta--cache-load))
+  (setq vegeta--entries-cache nil)
+  (clrhash vegeta--parse-queued-ids)
+  (setq vegeta--parse-queue nil)
   (let ((entries (vegeta--all-entries)))
     (vegeta--queue-uncached entries)
     (vegeta--redraw)
