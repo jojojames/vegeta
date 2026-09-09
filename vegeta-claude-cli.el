@@ -223,10 +223,13 @@ Falls back to a trivial decoding when no known root matches."
             (forward-line 1)))))
     (list :agent "Claude"
           :model model
-          :timestamp timestamp
+          :started-at timestamp
+          :updated-at nil
           :cwd cwd
           :session-id session-id
-          :preview preview))))
+          :first-prompt preview
+          :ai-title nil
+          :renamed nil))))
 
 ;;; Provider: :visit
 

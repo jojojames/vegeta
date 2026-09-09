@@ -96,10 +96,13 @@
                 (setq preview trimmed)))))
         (list :agent agent
               :model model
-              :timestamp started
+              :started-at started
+              :updated-at nil
               :cwd cwd
               :session-id session-id
-              :preview preview)))))
+              :first-prompt preview
+              :ai-title nil
+              :renamed nil)))))
 
 ;;; Cross-reference: transcript -> Claude CLI session-id
 
@@ -159,7 +162,7 @@ session picker via `session-strategy'."
   (let* ((meta (vegeta--ensure-parsed entry))
          (agent-name (plist-get meta :agent))
          (cwd (plist-get meta :cwd))
-         (started (plist-get meta :timestamp))
+         (started (plist-get meta :started-at))
          (session-id (or (plist-get meta :session-id)
                          (vegeta--find-claude-session-for-transcript
                           agent-name cwd started)))

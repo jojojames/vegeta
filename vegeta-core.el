@@ -159,12 +159,23 @@ drained."
 
 ;;; State
 
-(defconst vegeta--cache-schema 3
+(defconst vegeta--cache-schema 4
   "Bump when the parsed metadata format changes to invalidate old entries.")
 
 (defvar vegeta--parse-cache (make-hash-table :test 'equal)
   "Maps entry id -> (:schema INT :mtime FLOAT :meta PLIST).
-The meta plist keys are: :agent :model :timestamp :cwd :session-id :preview.")
+The meta plist keys are:
+  :agent         provider-supplied agent/model label string
+  :model         provider-supplied model id string
+  :started-at    conversation start timestamp string
+  :updated-at    last-activity timestamp string, nil to fall back to mtime
+  :cwd           working directory string
+  :session-id    provider-resumable session id, or nil
+  :first-prompt  user's first prompt (raw) or nil
+  :ai-title      provider-generated summary title, or nil
+  :renamed       user-supplied override title, or nil
+The rendered row title is picked from (:renamed :ai-title :first-prompt)
+in that order of priority.")
 
 (defvar vegeta--parse-timer nil
   "Active idle timer for chunked metadata parsing.")
@@ -302,7 +313,9 @@ Accepts both agent-shell's local-time format and Claude's ISO UTC form."
 ;;   :extras   PLIST              (provider-specific data, e.g. session-id)
 ;;
 ;; A META plist returned by :parse has keys:
-;;   :agent :model :timestamp :cwd :session-id :preview
+;;   :agent :model :started-at :updated-at :cwd :session-id
+;;   :first-prompt :ai-title :renamed
+;; See the docstring of `vegeta--parse-cache' for the semantics of each.
 
 (defvar vegeta-providers nil
   "Alist of (ID . PROVIDER-PLIST).")
@@ -497,16 +510,16 @@ skipped so parser changes invalidate stale data automatically."
       (plist-get entry :agent)))
 
 (defun vegeta--entry-preview (entry)
-  "Return the parsed preview for ENTRY, or nil if not yet parsed."
+  "Return the parsed first-prompt preview for ENTRY, or nil if not yet parsed."
   (let ((meta (vegeta--cached-meta entry)))
-    (and meta (plist-get meta :preview))))
+    (and meta (plist-get meta :first-prompt))))
 
 (defun vegeta--entry-timestamp (entry)
   "Return the display timestamp for ENTRY.
 Omits the MM-DD prefix when `date' is one of `vegeta-grouping', since
 each entry then already sits under a date section header."
   (let* ((meta (vegeta--cached-meta entry))
-         (ts (and meta (plist-get meta :timestamp)))
+         (ts (and meta (plist-get meta :started-at)))
          (date-grouped (memq 'date vegeta-grouping)))
     (cond
      ((and ts (string-match
@@ -529,9 +542,9 @@ each entry then already sits under a date section header."
 
 (defun vegeta--entry-date-key (entry)
   "Return a YYYY-MM-DD string for grouping ENTRY by date.
-Uses the parsed timestamp when available, else file mtime."
+Uses the parsed start timestamp when available, else file mtime."
   (let* ((meta (vegeta--cached-meta entry))
-         (ts (and meta (plist-get meta :timestamp))))
+         (ts (and meta (plist-get meta :started-at))))
     (cond
      ((and ts (string-match
                "\\`\\([0-9]\\{4\\}-[0-9]\\{2\\}-[0-9]\\{2\\}\\)"
@@ -690,8 +703,8 @@ ENTRIES-AT-NODE is the flat list of entries below this node."
                 (or (plist-get meta :agent) "?")
                 (or (plist-get meta :session-id) "(none)")
                 (or (plist-get meta :cwd) "?")
-                (if (plist-get meta :preview)
-                    (concat "\n\n" (plist-get meta :preview))
+                (if (plist-get meta :first-prompt)
+                    (concat "\n\n" (plist-get meta :first-prompt))
                   ""))
       id)))
 
