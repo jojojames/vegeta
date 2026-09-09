@@ -131,6 +131,14 @@ drained."
   "Seconds of idle time before a dirty cache is flushed to disk."
   :type 'number)
 
+(defcustom vegeta-updated-suffix-min-delta 300
+  "Minimum seconds between start and last-update to show the update suffix.
+When an entry's last-activity time is at least this many seconds after
+its start time, the row shows a `(updated MM-DD HH:MM)' suffix so the
+user can see the chat has continued past its opening prompt.  Set to
+nil to always hide the suffix."
+  :type '(choice (const :tag "Disabled" nil) integer))
+
 ;;; Faces
 
 (defface vegeta-package-face
@@ -148,6 +156,10 @@ drained."
 (defface vegeta-date-face
   '((t :inherit font-lock-constant-face))
   "Face for entry date column.")
+
+(defface vegeta-updated-face
+  '((t :inherit shadow))
+  "Face for the `(updated ...)' suffix on entry rows.")
 
 (defface vegeta-mark-face
   '((t :inherit warning))
@@ -525,6 +537,21 @@ summary), `:first-prompt' (raw user prompt)."
              (plist-get meta :ai-title)
              (plist-get meta :first-prompt)))))
 
+(defun vegeta--entry-started-at-seconds (entry)
+  "Return ENTRY's `:started-at' as float-time, or nil."
+  (let* ((meta (vegeta--cached-meta entry))
+         (raw (and meta (plist-get meta :started-at))))
+    (and raw (vegeta--iso-to-seconds raw))))
+
+(defun vegeta--entry-updated-at-seconds (entry)
+  "Return ENTRY's effective last-activity time as float-time, or nil.
+Prefers meta `:updated-at' when a provider supplied it; otherwise falls
+back to the filesystem mtime already carried on the entry."
+  (let* ((meta (vegeta--cached-meta entry))
+         (raw (and meta (plist-get meta :updated-at))))
+    (or (and raw (vegeta--iso-to-seconds raw))
+        (plist-get entry :mtime))))
+
 (defun vegeta--entry-timestamp (entry)
   "Return the display timestamp for ENTRY.
 Omits the MM-DD prefix when `date' is one of `vegeta-grouping', since
@@ -697,12 +724,23 @@ ENTRIES-AT-NODE is the flat list of entries below this node."
                  (propertize date-str
                              'face 'vegeta-placeholder-face)))
          (title (vegeta--entry-title entry))
+         (started (vegeta--entry-started-at-seconds entry))
+         (updated (vegeta--entry-updated-at-seconds entry))
+         (updated-suffix
+          (and vegeta-updated-suffix-min-delta
+               started updated
+               (> (- updated started) vegeta-updated-suffix-min-delta)
+               (propertize
+                (format-time-string " (updated %m-%d %H:%M)"
+                                    (seconds-to-time updated))
+                'face 'vegeta-updated-face)))
          (mark-str (if (eq mark 'delete)
                        (propertize "D" 'face 'vegeta-mark-face)
                      " "))
          (indent (make-string (+ 2 (* 2 depth)) ?\s))
          (start (point)))
     (insert indent mark-str " " date
+            (or updated-suffix "")
             (cond
              (title (concat ": " title))
              (parsed "")
