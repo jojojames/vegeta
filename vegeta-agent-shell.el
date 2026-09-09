@@ -79,21 +79,33 @@
         (goto-char (point-min))
         (when (re-search-forward "^\\*\\*Model:\\*\\*[ \t]+\\(.*\\)$" nil t)
           (setq model (string-trim (match-string 1))))
+        ;; Scan up to three User blocks looking for the first non-blank
+        ;; content line.  Skip empty lines, bare `>' prompt markers, and
+        ;; markdown code fences.  Strip a leading `> ' from any line
+        ;; before considering it.
         (goto-char (point-min))
-        (when (re-search-forward "^## User[^\n]*$" nil t)
-          (forward-line 1)
-          (while (and (not (eobp))
-                      (looking-at-p "^[ \t]*$"))
-            (forward-line 1))
-          (unless (eobp)
-            (let* ((line (buffer-substring-no-properties
-                          (point) (line-end-position)))
-                   (stripped (if (string-match "\\`>[ \t]*\\(.*\\)\\'" line)
-                                 (match-string 1 line)
-                               line))
-                   (trimmed (string-trim stripped)))
-              (unless (string-empty-p trimmed)
-                (setq preview trimmed)))))
+        (let ((tries 0))
+          (while (and (null preview)
+                      (< tries 3)
+                      (re-search-forward "^## User[^\n]*$" nil t))
+            (cl-incf tries)
+            (let ((block-end (or (save-excursion
+                                   (when (re-search-forward "^## " nil t)
+                                     (match-beginning 0)))
+                                 (point-max))))
+              (forward-line 1)
+              (while (and (null preview) (< (point) block-end))
+                (let* ((line (buffer-substring-no-properties
+                              (point) (line-end-position)))
+                       (stripped (if (string-match
+                                      "\\`>[ \t]*\\(.*\\)\\'" line)
+                                     (match-string 1 line)
+                                   line))
+                       (trimmed (string-trim stripped)))
+                  (unless (or (string-empty-p trimmed)
+                              (string-prefix-p "```" trimmed))
+                    (setq preview trimmed)))
+                (forward-line 1)))))
         (let ((xref (and (not session-id)
                          (vegeta--find-claude-session-for-transcript
                           agent cwd started))))
@@ -209,6 +221,18 @@ off to agent-shell's own session picker via `session-strategy'."
                     :no-focus t)))
           (vegeta--pop-to buf)))))))
 
+;;; Date key
+
+(defun vegeta--agent-shell-date-key (entry)
+  "Return YYYY-MM-DD extracted from an agent-shell transcript filename.
+Transcript filenames follow the `YYYY-MM-DD-HH-MM-SS.md' convention,
+so the date is available deterministically without parsing the file."
+  (let ((name (file-name-nondirectory (or (plist-get entry :id) ""))))
+    (if (string-match "\\`\\([0-9]\\{4\\}-[0-9]\\{2\\}-[0-9]\\{2\\}\\)-"
+                      name)
+        (match-string 1 name)
+      (vegeta--default-date-key entry))))
+
 ;;; Registration
 
 (vegeta-register-provider
@@ -216,7 +240,8 @@ off to agent-shell's own session picker via `session-strategy'."
        :name "agent-shell"
        :list #'vegeta--agent-shell-list
        :parse #'vegeta--agent-shell-parse
-       :visit #'vegeta--agent-shell-visit))
+       :visit #'vegeta--agent-shell-visit
+       :date-key #'vegeta--agent-shell-date-key))
 
 (provide 'vegeta-agent-shell)
 ;;; vegeta-agent-shell.el ends here

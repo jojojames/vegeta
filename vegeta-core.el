@@ -159,7 +159,7 @@ drained."
 
 ;;; State
 
-(defconst vegeta--cache-schema 5
+(defconst vegeta--cache-schema 6
   "Bump when the parsed metadata format changes to invalidate old entries.")
 
 (defvar vegeta--parse-cache (make-hash-table :test 'equal)
@@ -303,6 +303,7 @@ Accepts both agent-shell's local-time format and Claude's ISO UTC form."
 ;;   :list     () -> list of ENTRY plists (metadata may be partial) (required)
 ;;   :parse    (ENTRY) -> META plist                               (required)
 ;;   :visit    (ENTRY) -> side-effect (opens/resumes)              (required)
+;;   :date-key (ENTRY) -> "YYYY-MM-DD" for date grouping           (optional)
 ;;
 ;; An ENTRY is a plist with:
 ;;   :provider SYMBOL             (provider id)
@@ -550,9 +551,9 @@ each entry then already sits under a date section header."
 
 ;;; Grouping engine
 
-(defun vegeta--entry-date-key (entry)
-  "Return a YYYY-MM-DD string for grouping ENTRY by date.
-Uses the parsed start timestamp when available, else file mtime."
+(defun vegeta--default-date-key (entry)
+  "Default `:date-key' implementation for providers that don't supply one.
+Uses parsed `:started-at' when available, else file mtime, else `unknown'."
   (let* ((meta (vegeta--cached-meta entry))
          (ts (and meta (plist-get meta :started-at))))
     (cond
@@ -565,6 +566,16 @@ Uses the parsed start timestamp when available, else file mtime."
         (if mtime
             (format-time-string "%Y-%m-%d" (seconds-to-time mtime))
           "unknown"))))))
+
+(defun vegeta--entry-date-key (entry)
+  "Return a YYYY-MM-DD string for grouping ENTRY by date.
+Dispatches to the entry's provider `:date-key' function when defined.
+Providers should return a deterministic value that does not depend on
+whether the entry has been parsed yet — otherwise entries drift between
+groups as background parsing completes."
+  (let* ((provider (vegeta--entry-provider entry))
+         (fn (and provider (plist-get provider :date-key))))
+    (funcall (or fn #'vegeta--default-date-key) entry)))
 
 (defun vegeta--group-key (entry level)
   "Return the group key for ENTRY at LEVEL (a symbol)."

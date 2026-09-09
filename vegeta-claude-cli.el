@@ -271,6 +271,26 @@ first response."
     (vegeta--launch-terminal
      name vegeta-claude-cli-command args cwd)))
 
+;;; Date key
+
+(defun vegeta--claude-date-key (entry)
+  "Return YYYY-MM-DD for a Claude CLI ENTRY.
+Reads from the cached per-cwd JSONL header (populated lazily by
+`vegeta--claude-sessions-for-cwd') so the value is deterministic
+before the full parse runs.  Falls back to mtime, then `unknown'."
+  (let* ((repo (plist-get entry :repo))
+         (uuid (plist-get (plist-get entry :extras) :session-id))
+         (sessions (and repo uuid
+                        (vegeta--claude-sessions-for-cwd repo)))
+         (headers (and sessions (cdr (assoc uuid sessions))))
+         (first-ts (plist-get headers :first-ts)))
+    (cond
+     ((and first-ts (string-match
+                     "\\`\\([0-9]\\{4\\}-[0-9]\\{2\\}-[0-9]\\{2\\}\\)"
+                     first-ts))
+      (match-string 1 first-ts))
+     (t (vegeta--default-date-key entry)))))
+
 ;;; Registration
 
 (vegeta-register-provider
@@ -278,7 +298,8 @@ first response."
        :name "Claude CLI"
        :list #'vegeta--claude-list
        :parse #'vegeta--claude-parse
-       :visit #'vegeta--claude-visit))
+       :visit #'vegeta--claude-visit
+       :date-key #'vegeta--claude-date-key))
 
 (provide 'vegeta-claude-cli)
 ;;; vegeta-claude-cli.el ends here
