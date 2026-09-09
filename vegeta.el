@@ -106,7 +106,7 @@ Merged with `project-known-project-roots' and
   "Hide projects with no entries from the sidebar."
   :type 'boolean)
 
-(defcustom vegeta-grouping '(package repo model)
+(defcustom vegeta-grouping '(package repo model date)
   "Grouping levels for the sidebar tree, outermost first.
 Each element is one of the recognized levels:
   `package' — group by provider (e.g. agent-shell, Claude CLI)
@@ -814,21 +814,28 @@ Falls back to a trivial decoding when no known root matches."
     (and meta (plist-get meta :preview))))
 
 (defun vegeta--entry-timestamp (entry)
-  "Return the display timestamp for ENTRY as a short date."
+  "Return the display timestamp for ENTRY.
+Omits the MM-DD prefix when `date' is one of `vegeta-grouping', since
+each entry then already sits under a date section header."
   (let* ((meta (vegeta--cached-meta entry))
-         (ts (and meta (plist-get meta :timestamp))))
+         (ts (and meta (plist-get meta :timestamp)))
+         (date-grouped (memq 'date vegeta-grouping)))
     (cond
      ((and ts (string-match
                "\\`\\([0-9]\\{4\\}\\)-\\([0-9]\\{2\\}\\)-\\([0-9]\\{2\\}\\)[T ]\\([0-9]\\{2\\}\\):\\([0-9]\\{2\\}\\)"
                ts))
-      (format "%s-%s %s:%s"
-              (match-string 2 ts) (match-string 3 ts)
-              (match-string 4 ts) (match-string 5 ts)))
+      (if date-grouped
+          (format "%s:%s" (match-string 4 ts) (match-string 5 ts))
+        (format "%s-%s %s:%s"
+                (match-string 2 ts) (match-string 3 ts)
+                (match-string 4 ts) (match-string 5 ts))))
      (t
       (let ((mtime (plist-get entry :mtime)))
         (if mtime
-            (format-time-string "%m-%d %H:%M" (seconds-to-time mtime))
-          "??-?? ??:??"))))))
+            (format-time-string
+             (if date-grouped "%H:%M" "%m-%d %H:%M")
+             (seconds-to-time mtime))
+          (if date-grouped "??:??" "??-?? ??:??")))))))
 
 ;;; Grouping engine
 
