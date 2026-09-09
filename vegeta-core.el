@@ -354,6 +354,7 @@ Accepts both agent-shell's local-time format and Claude's ISO UTC form."
 ;;   :parse    (ENTRY) -> META plist                               (required)
 ;;   :visit    (ENTRY) -> side-effect (opens/resumes)              (required)
 ;;   :date-key (ENTRY) -> "YYYY-MM-DD" for date grouping           (optional)
+;;   :delete   (ENTRY) -> removes the entry's underlying storage   (optional)
 ;;
 ;; An ENTRY is a plist with:
 ;;   :provider SYMBOL             (provider id)
@@ -393,6 +394,15 @@ See the commentary in `vegeta-core.el' for the required keys."
 (defun vegeta--entry-provider (entry)
   "Return the provider plist for ENTRY."
   (alist-get (plist-get entry :provider) vegeta-providers))
+
+(defun vegeta--default-delete (entry)
+  "Default `:delete' fallback: remove the file at ENTRY's `:id'.
+Providers whose storage lives in a single file don't need to override
+this — it's the right thing.  Providers that keep sidecar files (a
+per-session env dir, an index entry, etc.) should implement `:delete'."
+  (let ((id (plist-get entry :id)))
+    (when (and id (file-exists-p id))
+      (delete-file id))))
 
 ;;; Cache
 
@@ -1172,8 +1182,20 @@ the override so the row falls back to `:ai-title' or `:first-prompt'."
     (vegeta--put-cache entry new-meta)
     (vegeta--redraw)))
 
+(defun vegeta--entry-by-id (id)
+  "Return the discovered entry with `:id' equal to ID, or nil.
+Consults `vegeta--entries-cache' — populated by the most recent
+refresh — so this is O(n) in the entry count but doesn't re-scan the
+filesystem."
+  (seq-find (lambda (e) (equal id (plist-get e :id)))
+            (or vegeta--entries-cache (vegeta--all-entries))))
+
 (defun vegeta-execute ()
-  "Delete all entries marked for deletion (removes the source file)."
+  "Delete all entries marked for deletion.
+Each entry's `:delete' provider hook decides how to remove its
+storage — most providers just delete the file, but a Claude CLI
+session also cleans its sidecar `session-env/<uuid>' directory.
+Failures on individual entries are reported but don't abort the batch."
   (interactive)
   (let (ids)
     (maphash (lambda (id mark)
@@ -1181,15 +1203,28 @@ the override so the row falls back to `:ai-title' or `:first-prompt'."
              vegeta--marks)
     (cond
      ((null ids) (message "No marks to execute"))
-     ((yes-or-no-p (format "Delete %d chat file(s)? " (length ids)))
-      (dolist (id ids)
-        (when (file-exists-p id)
-          (delete-file id))
-        (remhash id vegeta--parse-cache)
-        (remhash id vegeta--marks))
-      (vegeta--cache-mark-dirty)
-      (vegeta-refresh)
-      (message "Deleted %d file(s)" (length ids))))))
+     ((yes-or-no-p (format "Delete %d chat(s)? " (length ids)))
+      (let ((ok 0) (fail 0))
+        (dolist (id ids)
+          (let* ((entry (vegeta--entry-by-id id))
+                 (provider (and entry (vegeta--entry-provider entry)))
+                 (deleter (or (and provider (plist-get provider :delete))
+                              #'vegeta--default-delete)))
+            (condition-case err
+                (progn
+                  (when entry (funcall deleter entry))
+                  (cl-incf ok))
+              (error
+               (cl-incf fail)
+               (message "vegeta: failed to delete %s: %S"
+                        (file-name-nondirectory id)
+                        (error-message-string err)))))
+          (remhash id vegeta--parse-cache)
+          (remhash id vegeta--marks))
+        (vegeta--cache-mark-dirty)
+        (vegeta-refresh)
+        (message "vegeta: deleted %d chat(s)%s"
+                 ok (if (zerop fail) "" (format " (%d failed)" fail))))))))
 
 ;;; Commands: refresh
 

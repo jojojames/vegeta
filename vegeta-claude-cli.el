@@ -46,6 +46,14 @@ The UUID is appended as the final argument."
   :type 'directory
   :group 'vegeta)
 
+(defcustom vegeta-claude-cli-session-env-dir
+  (expand-file-name "~/.claude/session-env/")
+  "Directory where Claude CLI stores per-session env sidecars.
+Each session has a subdirectory named after its UUID.  Removed by the
+provider's `:delete' hook alongside the main JSONL."
+  :type 'directory
+  :group 'vegeta)
+
 ;;; Project-dir encoding
 
 (defun vegeta--claude-encode-path (path)
@@ -278,6 +286,26 @@ first response."
     (vegeta--launch-terminal
      name vegeta-claude-cli-command args cwd)))
 
+;;; Delete
+
+(defun vegeta--claude-delete (entry)
+  "Remove ENTRY's Claude session storage.
+Deletes both the main `.jsonl' file and its `session-env/<uuid>/'
+sidecar directory (Claude Code writes per-session env state there).
+The parent project directory under `vegeta-claude-cli-projects-dir'
+is left alone even if it becomes empty, since Claude Code recreates
+it on demand."
+  (let* ((path (plist-get entry :id))
+         (uuid (or (plist-get (plist-get entry :extras) :session-id)
+                   (and path (file-name-base path))))
+         (env-dir (and uuid
+                       (expand-file-name
+                        uuid vegeta-claude-cli-session-env-dir))))
+    (when (and path (file-exists-p path))
+      (delete-file path))
+    (when (and env-dir (file-directory-p env-dir))
+      (delete-directory env-dir t))))
+
 ;;; Date key
 
 (defun vegeta--claude-date-key (entry)
@@ -306,7 +334,8 @@ before the full parse runs.  Falls back to mtime, then `unknown'."
        :list #'vegeta--claude-list
        :parse #'vegeta--claude-parse
        :visit #'vegeta--claude-visit
-       :date-key #'vegeta--claude-date-key))
+       :date-key #'vegeta--claude-date-key
+       :delete #'vegeta--claude-delete))
 
 (provide 'vegeta-claude-cli)
 ;;; vegeta-claude-cli.el ends here
