@@ -119,6 +119,18 @@ tries ghostel, then vterm, then `term'."
   :type '(choice (const :tag "Auto (ghostel > vterm > term)" nil)
                  function))
 
+(defcustom vegeta-cache-file
+  (expand-file-name ".vegeta-cache.eld" user-emacs-directory)
+  "File where parsed metadata is persisted across sessions.
+Loaded lazily on the first refresh; rewritten by an idle timer
+whenever the in-memory cache is dirty and the parse queue is
+drained."
+  :type 'file)
+
+(defcustom vegeta-cache-flush-idle-delay 2.0
+  "Seconds of idle time before a dirty cache is flushed to disk."
+  :type 'number)
+
 ;;; Faces
 
 (defface vegeta-package-face
@@ -168,6 +180,15 @@ The meta plist keys are: :agent :model :timestamp :cwd :session-id :preview.")
 
 (defvar-local vegeta--refresh-timer-object nil
   "Per-buffer idle timer for auto-refresh.")
+
+(defvar vegeta--cache-loaded nil
+  "Non-nil once the on-disk cache has been loaded (or attempted).")
+
+(defvar vegeta--cache-dirty nil
+  "Non-nil when in-memory cache has changes not yet flushed to disk.")
+
+(defvar vegeta--cache-flush-timer nil
+  "Active idle timer for flushing the cache to disk.")
 
 ;;; Project roots
 
@@ -328,7 +349,8 @@ See the commentary in `vegeta-core.el' for the required keys."
            (list :schema vegeta--cache-schema
                  :mtime (plist-get entry :mtime)
                  :meta meta)
-           vegeta--parse-cache))
+           vegeta--parse-cache)
+  (vegeta--cache-mark-dirty))
 
 (defun vegeta--ensure-parsed (entry)
   "Return metadata for ENTRY, parsing synchronously on cache miss."
@@ -338,6 +360,77 @@ See the commentary in `vegeta-core.el' for the required keys."
              (meta (and parser (funcall parser entry))))
         (vegeta--put-cache entry meta)
         meta)))
+
+;;; Cache persistence
+
+(defun vegeta--cache-load ()
+  "Load persisted metadata cache into `vegeta--parse-cache'.
+Silent no-op when the cache file doesn't exist.  Cache entries whose
+schema version differs from the current `vegeta--cache-schema' are
+skipped so parser changes invalidate stale data automatically."
+  (setq vegeta--cache-loaded t)
+  (when (file-readable-p vegeta-cache-file)
+    (condition-case err
+        (with-temp-buffer
+          (insert-file-contents vegeta-cache-file)
+          (goto-char (point-min))
+          (let* ((data (read (current-buffer)))
+                 (entries (plist-get data :entries))
+                 (loaded 0))
+            (dolist (row entries)
+              (let* ((id (car row))
+                     (cell (cdr row))
+                     (schema (plist-get cell :schema)))
+                (when (equal schema vegeta--cache-schema)
+                  (puthash id cell vegeta--parse-cache)
+                  (cl-incf loaded))))
+            (message "vegeta: loaded %d cached entries from %s"
+                     loaded vegeta-cache-file)))
+      (error
+       (message "vegeta: failed to load cache file %s: %S"
+                vegeta-cache-file err)))))
+
+(defun vegeta--cache-save ()
+  "Write `vegeta--parse-cache' to `vegeta-cache-file' atomically."
+  (condition-case err
+      (let (entries)
+        (maphash (lambda (id cell) (push (cons id cell) entries))
+                 vegeta--parse-cache)
+        (make-directory (file-name-directory vegeta-cache-file) t)
+        (with-temp-file vegeta-cache-file
+          (let ((print-length nil)
+                (print-level nil)
+                (print-circle nil))
+            (insert ";; vegeta metadata cache -- auto-generated, do not edit by hand\n")
+            (prin1 (list :vegeta-schema vegeta--cache-schema
+                         :written-at (float-time)
+                         :count (length entries)
+                         :entries entries)
+                   (current-buffer))
+            (insert "\n")))
+        (setq vegeta--cache-dirty nil))
+    (error
+     (message "vegeta: failed to save cache file %s: %S"
+              vegeta-cache-file err))))
+
+(defun vegeta--cache-mark-dirty ()
+  "Mark the in-memory cache as dirty and schedule a background flush."
+  (setq vegeta--cache-dirty t)
+  (unless (timerp vegeta--cache-flush-timer)
+    (setq vegeta--cache-flush-timer
+          (run-with-idle-timer
+           vegeta-cache-flush-idle-delay t
+           #'vegeta--cache-flush-tick))))
+
+(defun vegeta--cache-flush-tick ()
+  "Idle-timer tick: flush cache to disk when dirty and parsing has drained."
+  (when (and vegeta--cache-dirty
+             (null vegeta--parse-queue))
+    (vegeta--cache-save))
+  (unless vegeta--cache-dirty
+    (when (timerp vegeta--cache-flush-timer)
+      (cancel-timer vegeta--cache-flush-timer))
+    (setq vegeta--cache-flush-timer nil)))
 
 ;;; Async parse loop
 
@@ -839,14 +932,20 @@ provider `:visit' function."
           (delete-file id))
         (remhash id vegeta--parse-cache)
         (remhash id vegeta--marks))
+      (vegeta--cache-mark-dirty)
       (vegeta-refresh)
       (message "Deleted %d file(s)" (length ids))))))
 
 ;;; Commands: refresh
 
 (defun vegeta-refresh ()
-  "Rescan providers and redraw."
+  "Rescan providers and redraw.
+On the first invocation of an Emacs session, the persisted cache from
+`vegeta-cache-file' is loaded before the scan so entries with fresh
+cached metadata render immediately."
   (interactive)
+  (unless vegeta--cache-loaded
+    (vegeta--cache-load))
   (let ((entries (vegeta--all-entries)))
     (vegeta--queue-uncached entries)
     (vegeta--redraw)
