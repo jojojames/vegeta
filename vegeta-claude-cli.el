@@ -79,32 +79,46 @@ Falls back to a trivial decoding when no known root matches."
 
 (defvar vegeta--claude-sessions-by-cwd-cache
   (make-hash-table :test 'equal)
-  "Cache of cwd -> list of (uuid . first-timestamp-seconds).")
+  "Cache of cwd -> list of (UUID . HEADERS-PLIST).
+HEADERS-PLIST has keys `:first-ts' (string) and `:ai-title' (string or nil).")
 
-(defun vegeta--claude-jsonl-first-timestamp (file)
-  "Return the first `timestamp' field found in JSONL FILE, or nil."
-  (with-temp-buffer
-    (condition-case _
-        (insert-file-contents file nil 0 4096)
-      (error nil))
-    (goto-char (point-min))
-    (let ((json-object-type 'alist)
-          (json-array-type 'list)
-          (json-key-type 'symbol)
-          ts)
-      (while (and (not ts) (not (eobp)))
-        (let* ((line (buffer-substring-no-properties
-                      (point) (line-end-position)))
-               (obj (condition-case _
-                        (json-read-from-string line)
-                      (error nil))))
-          (when-let* ((t2 (and obj (alist-get 'timestamp obj))))
-            (setq ts t2)))
-        (forward-line 1))
-      ts)))
+(defun vegeta--claude-jsonl-headers (file)
+  "Return a plist of header fields extracted from JSONL FILE.
+Keys: `:first-ts' (first message timestamp) and `:ai-title' (session summary).
+Nil values indicate the field wasn't present in the scanned prefix."
+  (let (first-ts ai-title)
+    (with-temp-buffer
+      (condition-case _
+          (insert-file-contents file nil 0 16384)
+        (error nil))
+      (goto-char (point-min))
+      (let ((json-object-type 'alist)
+            (json-array-type 'list)
+            (json-key-type 'symbol)
+            (max-lines 30)
+            (n 0))
+        (while (and (not (eobp))
+                    (< n max-lines)
+                    (or (null first-ts) (null ai-title)))
+          (let* ((line (buffer-substring-no-properties
+                        (point) (line-end-position)))
+                 (obj (condition-case _
+                          (json-read-from-string line)
+                        (error nil))))
+            (when obj
+              (unless first-ts
+                (when-let* ((ts (alist-get 'timestamp obj)))
+                  (setq first-ts ts)))
+              (unless ai-title
+                (when-let* ((t2 (alist-get 'aiTitle obj)))
+                  (setq ai-title t2)))))
+          (forward-line 1)
+          (cl-incf n))))
+    (list :first-ts first-ts :ai-title ai-title)))
 
 (defun vegeta--claude-sessions-for-cwd (cwd)
-  "Return list of (UUID . SECONDS) for Claude CLI sessions in CWD."
+  "Return list of (UUID . HEADERS-PLIST) for Claude CLI sessions in CWD.
+See `vegeta--claude-jsonl-headers' for HEADERS-PLIST keys."
   (let ((cached (gethash cwd vegeta--claude-sessions-by-cwd-cache
                          'not-cached)))
     (if (not (eq cached 'not-cached))
@@ -116,9 +130,9 @@ Falls back to a trivial decoding when no known root matches."
         (when (file-directory-p dir)
           (dolist (f (ignore-errors
                        (directory-files dir t "\\.jsonl\\'" t)))
-            (when-let* ((ts (vegeta--claude-jsonl-first-timestamp f))
-                        (secs (vegeta--iso-to-seconds ts)))
-              (push (cons (file-name-base f) secs) sessions))))
+            (let ((headers (vegeta--claude-jsonl-headers f)))
+              (when (plist-get headers :first-ts)
+                (push (cons (file-name-base f) headers) sessions)))))
         (puthash cwd sessions
                  vegeta--claude-sessions-by-cwd-cache)
         sessions))))
@@ -159,11 +173,14 @@ Falls back to a trivial decoding when no known root matches."
 ;;; Provider: :parse
 
 (defun vegeta--claude-parse (entry)
-  "Parse the first non-meta user message from a Claude CLI JSONL ENTRY."
+  "Parse metadata from a Claude CLI JSONL ENTRY.
+Extracts the session cwd, model, first user prompt, first-message
+timestamp, and the `aiTitle' summary Claude Code generates on
+first response."
   (let ((file (plist-get entry :id))
         (session-id (plist-get (plist-get entry :extras) :session-id))
         (bytes-to-read 65536)
-        cwd model timestamp preview)
+        cwd model timestamp preview ai-title)
     (with-temp-buffer
       (condition-case _
           (insert-file-contents file nil 0 bytes-to-read)
@@ -173,7 +190,8 @@ Falls back to a trivial decoding when no known root matches."
             (json-array-type 'list)
             (json-key-type 'symbol))
         (while (and (not (eobp))
-                    (or (null preview) (null cwd) (null timestamp)))
+                    (or (null preview) (null cwd) (null timestamp)
+                        (null ai-title)))
           (let ((line-end (line-end-position))
                 obj)
             (setq obj
@@ -188,6 +206,9 @@ Falls back to a trivial decoding when no known root matches."
               (unless cwd
                 (when-let* ((c (alist-get 'cwd obj)))
                   (setq cwd c)))
+              (unless ai-title
+                (when-let* ((t2 (alist-get 'aiTitle obj)))
+                  (setq ai-title t2)))
               (unless model
                 (when-let* ((msg (alist-get 'message obj))
                             (m (alist-get 'model msg)))
@@ -228,7 +249,7 @@ Falls back to a trivial decoding when no known root matches."
           :cwd cwd
           :session-id session-id
           :first-prompt preview
-          :ai-title nil
+          :ai-title ai-title
           :renamed nil))))
 
 ;;; Provider: :visit

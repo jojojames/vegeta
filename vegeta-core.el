@@ -159,7 +159,7 @@ drained."
 
 ;;; State
 
-(defconst vegeta--cache-schema 4
+(defconst vegeta--cache-schema 5
   "Bump when the parsed metadata format changes to invalidate old entries.")
 
 (defvar vegeta--parse-cache (make-hash-table :test 'equal)
@@ -514,6 +514,16 @@ skipped so parser changes invalidate stale data automatically."
   (let ((meta (vegeta--cached-meta entry)))
     (and meta (plist-get meta :first-prompt))))
 
+(defun vegeta--entry-title (entry)
+  "Return the display title for ENTRY, or nil if not yet parsed.
+Priority order: `:renamed' (user override), `:ai-title' (provider
+summary), `:first-prompt' (raw user prompt)."
+  (let ((meta (vegeta--cached-meta entry)))
+    (and meta
+         (or (plist-get meta :renamed)
+             (plist-get meta :ai-title)
+             (plist-get meta :first-prompt)))))
+
 (defun vegeta--entry-timestamp (entry)
   "Return the display timestamp for ENTRY.
 Omits the MM-DD prefix when `date' is one of `vegeta-grouping', since
@@ -675,7 +685,7 @@ ENTRIES-AT-NODE is the flat list of entries below this node."
                    (propertize date-str 'face 'vegeta-date-face)
                  (propertize date-str
                              'face 'vegeta-placeholder-face)))
-         (preview (vegeta--entry-preview entry))
+         (title (vegeta--entry-title entry))
          (mark-str (if (eq mark 'delete)
                        (propertize "D" 'face 'vegeta-mark-face)
                      " "))
@@ -683,7 +693,7 @@ ENTRIES-AT-NODE is the flat list of entries below this node."
          (start (point)))
     (insert indent mark-str " " date
             (cond
-             (preview (concat ": " preview))
+             (title (concat ": " title))
              (parsed "")
              (t (concat ": " vegeta--placeholder))))
     (add-text-properties
@@ -697,15 +707,18 @@ ENTRIES-AT-NODE is the flat list of entries below this node."
   (let ((meta (vegeta--cached-meta entry))
         (id (plist-get entry :id)))
     (if meta
-        (format "%s\nProvider: %s\nAgent: %s\nSession: %s\nCwd: %s%s"
-                id
-                (plist-get entry :provider)
-                (or (plist-get meta :agent) "?")
-                (or (plist-get meta :session-id) "(none)")
-                (or (plist-get meta :cwd) "?")
-                (if (plist-get meta :first-prompt)
-                    (concat "\n\n" (plist-get meta :first-prompt))
-                  ""))
+        (let ((renamed (plist-get meta :renamed))
+              (ai-title (plist-get meta :ai-title))
+              (first-prompt (plist-get meta :first-prompt)))
+          (format "%s\nProvider: %s\nAgent: %s\nSession: %s\nCwd: %s%s%s%s"
+                  id
+                  (plist-get entry :provider)
+                  (or (plist-get meta :agent) "?")
+                  (or (plist-get meta :session-id) "(none)")
+                  (or (plist-get meta :cwd) "?")
+                  (if renamed (format "\nRenamed: %s" renamed) "")
+                  (if ai-title (format "\nAI title: %s" ai-title) "")
+                  (if first-prompt (format "\n\n%s" first-prompt) "")))
       id)))
 
 (defun vegeta--render-tree (nodes depth)
@@ -801,6 +814,7 @@ ENTRIES-AT-NODE is the flat list of entries below this node."
     (define-key map (kbd "u") #'vegeta-unmark)
     (define-key map (kbd "U") #'vegeta-unmark-all)
     (define-key map (kbd "x") #'vegeta-execute)
+    (define-key map (kbd "r") #'vegeta-rename)
     (define-key map (kbd "TAB") #'vegeta-toggle-group)
     (define-key map (kbd "<tab>") #'vegeta-toggle-group)
     (define-key map [mouse-2] #'vegeta-mouse-visit)
@@ -930,6 +944,31 @@ provider `:visit' function."
   (clrhash vegeta--marks)
   (vegeta--redraw))
 
+;;; Commands: rename
+
+(defun vegeta-rename (new-title)
+  "Set a user-supplied title for the entry at point.
+Stored as `:renamed' in the entry's cached metadata; empty input clears
+the override so the row falls back to `:ai-title' or `:first-prompt'."
+  (interactive
+   (list (let* ((entry (or (get-text-property (point) 'vegeta-entry)
+                           (user-error "No entry at point")))
+                (meta (vegeta--cached-meta entry)))
+           (unless meta (user-error "Entry not parsed yet; press g to refresh"))
+           (read-string "Rename to (empty to clear): "
+                        (or (plist-get meta :renamed)
+                            (plist-get meta :ai-title)
+                            (plist-get meta :first-prompt)
+                            "")))))
+  (let* ((entry (get-text-property (point) 'vegeta-entry))
+         (meta (vegeta--cached-meta entry))
+         (trimmed (string-trim new-title))
+         (new-meta (plist-put (copy-sequence meta)
+                              :renamed
+                              (if (string-empty-p trimmed) nil trimmed))))
+    (vegeta--put-cache entry new-meta)
+    (vegeta--redraw)))
+
 (defun vegeta-execute ()
   "Delete all entries marked for deletion (removes the source file)."
   (interactive)
@@ -1057,6 +1096,7 @@ cached metadata render immediately."
       (kbd "u")   #'vegeta-unmark
       (kbd "U")   #'vegeta-unmark-all
       (kbd "x")   #'vegeta-execute
+      (kbd "r")   #'vegeta-rename
       (kbd "TAB") #'vegeta-toggle-group
       (kbd "^")   #'vegeta-toggle-group
       (kbd "-")   #'vegeta-toggle-group

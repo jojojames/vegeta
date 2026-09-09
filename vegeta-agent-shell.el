@@ -94,34 +94,43 @@
                    (trimmed (string-trim stripped)))
               (unless (string-empty-p trimmed)
                 (setq preview trimmed)))))
-        (list :agent agent
-              :model model
-              :started-at started
-              :updated-at nil
-              :cwd cwd
-              :session-id session-id
-              :first-prompt preview
-              :ai-title nil
-              :renamed nil)))))
+        (let ((xref (and (not session-id)
+                         (vegeta--find-claude-session-for-transcript
+                          agent cwd started))))
+          (list :agent agent
+                :model model
+                :started-at started
+                :updated-at nil
+                :cwd cwd
+                :session-id (or session-id (plist-get xref :uuid))
+                :first-prompt preview
+                :ai-title (plist-get xref :ai-title)
+                :renamed nil))))))
 
-;;; Cross-reference: transcript -> Claude CLI session-id
+;;; Cross-reference: transcript -> Claude CLI session
 
 (defun vegeta--find-claude-session-for-transcript
     (agent-name cwd started-str)
-  "Return a Claude CLI session UUID matching a transcript, or nil.
-Matches when AGENT-NAME resolves to Claude, CWD has Claude sessions,
-and one of them started within 60 seconds of STARTED-STR."
+  "Return a plist for a Claude CLI session matching a transcript, or nil.
+Result plist has keys `:uuid' and `:ai-title'.  Matches when AGENT-NAME
+resolves to Claude, CWD has Claude sessions, and one of them started
+within 60 seconds of STARTED-STR."
   (when (and agent-name cwd started-str
              (string-match-p "\\`Claude" agent-name))
     (when-let* ((tx-secs (vegeta--iso-to-seconds started-str))
                 (sessions (vegeta--claude-sessions-for-cwd cwd)))
-      (let (best-uuid best-delta)
+      (let (best-uuid best-headers best-delta)
         (dolist (s sessions)
-          (let ((delta (abs (- tx-secs (cdr s)))))
-            (when (or (null best-delta) (< delta best-delta))
+          (let* ((first-ts (plist-get (cdr s) :first-ts))
+                 (secs (and first-ts (vegeta--iso-to-seconds first-ts)))
+                 (delta (and secs (abs (- tx-secs secs)))))
+            (when (and delta (or (null best-delta) (< delta best-delta)))
               (setq best-uuid (car s)
+                    best-headers (cdr s)
                     best-delta delta))))
-        (and best-uuid best-delta (< best-delta 60) best-uuid)))))
+        (when (and best-uuid best-delta (< best-delta 60))
+          (list :uuid best-uuid
+                :ai-title (plist-get best-headers :ai-title)))))))
 
 ;;; Visit
 
@@ -155,21 +164,14 @@ and one of them started within 60 seconds of STARTED-STR."
 
 (defun vegeta--agent-shell-visit (entry)
   "Visit an agent-shell ENTRY: resume live buffer, or start a new shell.
-When the transcript lacks a `**Session ID:**' header, cross-reference
-Claude CLI's own JSONL storage by cwd + start-timestamp to recover the
-resumable session id.  As a last resort, hand off to agent-shell's own
-session picker via `session-strategy'."
+Parse-time cross-reference populates `:session-id' via Claude CLI JSONL
+when the transcript header didn't supply one.  As a last resort, hand
+off to agent-shell's own session picker via `session-strategy'."
   (let* ((meta (vegeta--ensure-parsed entry))
          (agent-name (plist-get meta :agent))
          (cwd (plist-get meta :cwd))
-         (started (plist-get meta :started-at))
-         (session-id (or (plist-get meta :session-id)
-                         (vegeta--find-claude-session-for-transcript
-                          agent-name cwd started)))
-         (session-source (cond
-                          ((plist-get meta :session-id) 'from-transcript)
-                          (session-id 'from-claude-cli)
-                          (t 'none)))
+         (session-id (plist-get meta :session-id))
+         (session-source (if session-id 'cached 'none))
          (live (vegeta--live-agent-shell-buffer-for-session session-id)))
     (cond
      (live
