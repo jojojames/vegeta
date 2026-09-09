@@ -924,22 +924,25 @@ ENTRIES-AT-NODE is the flat list of entries below this node."
                (switch-to-buffer buffer))
       (pop-to-buffer buffer))))
 
-(defun vegeta-visit ()
+(defun vegeta-visit (&optional prefix)
   "Activate the row at point.
-Group headers toggle their fold; chat rows dispatch to the entry's
-provider `:visit' function."
-  (interactive)
+Group headers toggle their fold.  Chat rows dispatch to the entry's
+provider `:visit' function by default; with PREFIX arg (\\[universal-argument])
+the raw transcript file is opened instead."
+  (interactive "P")
   (cond
    ((get-text-property (point) 'vegeta-group)
     (vegeta-toggle-group))
    ((get-text-property (point) 'vegeta-entry)
-    (let* ((entry (get-text-property (point) 'vegeta-entry))
-           (provider (vegeta--entry-provider entry))
-           (visitor (plist-get provider :visit)))
-      (unless visitor
-        (user-error "Provider %s has no :visit function"
-                    (plist-get entry :provider)))
-      (funcall visitor entry)))
+    (if prefix
+        (vegeta-open-transcript)
+      (let* ((entry (get-text-property (point) 'vegeta-entry))
+             (provider (vegeta--entry-provider entry))
+             (visitor (plist-get provider :visit)))
+        (unless visitor
+          (user-error "Provider %s has no :visit function"
+                      (plist-get entry :provider)))
+        (funcall visitor entry))))
    (t (user-error "Nothing at point"))))
 
 (defun vegeta-mouse-visit (event)

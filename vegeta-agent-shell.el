@@ -27,6 +27,19 @@
 (require 'vegeta-core)
 (require 'vegeta-claude-cli)
 
+(defcustom vegeta-agent-shell-orphan-prompt
+  "Please re-read the transcript at %s and summarize what we were working on so I can continue."
+  "Prompt inserted into a fresh shell when visiting an orphaned chat.
+An orphaned agent-shell entry is one whose session is no longer
+resumable (no session id in the transcript header and no matching
+Claude CLI JSONL to cross-reference).  Rather than dropping the user
+into an empty shell, we start a new one at the transcript's cwd and
+pre-fill this prompt so the model can summarize prior work.  %s is
+replaced with the transcript file path.  The user still has to press
+RET to send."
+  :type 'string
+  :group 'vegeta)
+
 ;;; Discovery
 
 (defun vegeta--agent-shell-transcripts-for-root (root)
@@ -175,15 +188,23 @@ within 60 seconds of STARTED-STR."
                     configs)))))
 
 (defun vegeta--agent-shell-visit (entry)
-  "Visit an agent-shell ENTRY: resume live buffer, or start a new shell.
-Parse-time cross-reference populates `:session-id' via Claude CLI JSONL
-when the transcript header didn't supply one.  As a last resort, hand
-off to agent-shell's own session picker via `session-strategy'."
+  "Visit an agent-shell ENTRY.
+When `:session-id' is known (either from the transcript header or from
+parse-time Claude CLI cross-reference), resume that session — or jump
+to its live buffer if one is already open.
+
+When the entry is orphaned (no resumable session), start a fresh shell
+at the recorded cwd and prefill `vegeta-agent-shell-orphan-prompt' so
+the model can be asked to re-read the transcript, rather than dropping
+the user into an empty shell that has no idea what preceded it.  The
+user still has to press RET to send the prefilled prompt.
+
+Use \\[universal-argument] before RET on the row to bypass this entirely
+and open the raw transcript file instead."
   (let* ((meta (vegeta--ensure-parsed entry))
          (agent-name (plist-get meta :agent))
          (cwd (plist-get meta :cwd))
          (session-id (plist-get meta :session-id))
-         (session-source (if session-id 'cached 'none))
          (live (vegeta--live-agent-shell-buffer-for-session session-id)))
     (cond
      (live
@@ -203,23 +224,33 @@ off to agent-shell's own session picker via `session-strategy'."
              (config (or matched
                          auto
                          (agent-shell-select-config
-                          :prompt "Start with agent: ")))
-             ;; When we don't know the session id, hand off to agent-shell's
-             ;; own session picker (ACP `session/list' → `session/resume').
-             ;; This is the same flow the user sees from `agent-shell-new-shell'.
-             (session-strategy (if session-id 'new 'prompt)))
-        (message "vegeta[agent-shell]: file=%s agent=%S session=%S (%s) config=%s (%s) strategy=%s cwd=%s"
+                          :prompt "Start with agent: "))))
+        (message "vegeta[agent-shell]: file=%s agent=%S session=%S config=%s (%s) mode=%s cwd=%s"
                  (file-name-nondirectory (plist-get entry :id))
-                 agent-name session-id session-source
+                 agent-name session-id
                  (map-elt config :identifier) config-source
-                 session-strategy default-directory)
+                 (if session-id "resume" "orphan+prompt")
+                 default-directory)
         (let ((buf (agent-shell--start
                     :config config
                     :session-id session-id
-                    :session-strategy session-strategy
+                    :session-strategy 'new
                     :new-session t
                     :no-focus t)))
+          (unless session-id
+            (vegeta--agent-shell-prefill-orphan-prompt
+             buf (plist-get entry :id)))
           (vegeta--pop-to buf)))))))
+
+(defun vegeta--agent-shell-prefill-orphan-prompt (buffer transcript-path)
+  "Insert `vegeta-agent-shell-orphan-prompt' at the input point of BUFFER.
+TRANSCRIPT-PATH is spliced into the template.  Does not send the prompt
+— the user reviews and presses RET."
+  (when (buffer-live-p buffer)
+    (with-current-buffer buffer
+      (goto-char (point-max))
+      (insert (format vegeta-agent-shell-orphan-prompt
+                      transcript-path)))))
 
 ;;; Date key
 
