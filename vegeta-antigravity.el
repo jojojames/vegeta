@@ -312,7 +312,9 @@ so this is best-effort local cleanup."
        :parse #'vegeta--antigravity-parse
        :visit #'vegeta--antigravity-visit
        :date-key #'vegeta--antigravity-date-key
-       :delete #'vegeta--antigravity-delete))
+       :delete #'vegeta--antigravity-delete
+       ;; Every IDE conversation is Gemini; skip the redundant model level.
+       :skip-levels '(model)))
 
 (provide 'vegeta-antigravity)
 ;;; vegeta-antigravity.el ends here

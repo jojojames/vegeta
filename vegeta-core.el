@@ -349,13 +349,16 @@ Accepts both agent-shell's local-time format and Claude's ISO UTC form."
 ;;; Provider protocol
 ;;
 ;; A provider is a plist with the keys:
-;;   :id       symbol, e.g. `agent-shell'                          (required)
-;;   :name     display string, e.g. "agent-shell"                  (required)
-;;   :list     () -> list of ENTRY plists (metadata may be partial) (required)
-;;   :parse    (ENTRY) -> META plist                               (required)
-;;   :visit    (ENTRY) -> side-effect (opens/resumes)              (required)
-;;   :date-key (ENTRY) -> "YYYY-MM-DD" for date grouping           (optional)
-;;   :delete   (ENTRY) -> removes the entry's underlying storage   (optional)
+;;   :id           symbol, e.g. `agent-shell'                          (required)
+;;   :name         display string, e.g. "agent-shell"                  (required)
+;;   :list         () -> list of ENTRY plists                          (required)
+;;   :parse        (ENTRY) -> META plist                               (required)
+;;   :visit        (ENTRY) -> side-effect (opens/resumes)              (required)
+;;   :date-key     (ENTRY) -> "YYYY-MM-DD" for date grouping           (optional)
+;;   :delete       (ENTRY) -> removes the entry's underlying storage   (optional)
+;;   :skip-levels  list of level symbols to omit from grouping for
+;;                 this provider's entries (e.g. `(model)' for a
+;;                 single-agent provider like `claude-cli')            (optional)
 ;;
 ;; An ENTRY is a plist with:
 ;;   :provider SYMBOL             (provider id)
@@ -789,6 +792,18 @@ groups as background parsing completes."
     ('date    (vegeta--entry-date-key entry))
     (_ nil)))
 
+(defun vegeta--provider-levels (provider-id default-levels)
+  "Return the tree levels to apply below a `package' node for PROVIDER-ID.
+Filters DEFAULT-LEVELS by removing anything listed in the provider's
+`:skip-levels'.  Providers use this to avoid degenerate one-child
+groupings like `Claude (all)' under `claude-cli' — the model level
+adds no information when the provider only ever emits one agent."
+  (let* ((prov (alist-get provider-id vegeta-providers))
+         (skips (and prov (plist-get prov :skip-levels))))
+    (if skips
+        (seq-remove (lambda (l) (memq l skips)) default-levels)
+      default-levels)))
+
 (defun vegeta--build-tree (entries levels)
   "Group ENTRIES recursively by LEVELS, returning a nested tree.
 Node shape: (:level LEVEL :key KEY :breadcrumb (KEYS...)
@@ -812,13 +827,20 @@ Node shape: (:level LEVEL :key KEY :breadcrumb (KEYS...)
              (mapcar
               (lambda (k)
                 (let* ((es (nreverse (gethash k groups)))
-                       (crumb (append breadcrumb (list (cons level k)))))
+                       (crumb (append breadcrumb (list (cons level k))))
+                       ;; Once we've split by `package', each subtree
+                       ;; belongs to one provider — switch to that
+                       ;; provider's own level list so single-agent
+                       ;; providers can collapse the model level.
+                       (sub-levels (if (eq level 'package)
+                                       (vegeta--provider-levels k rest)
+                                     rest)))
                   (list :level level
                         :key k
                         :breadcrumb crumb
                         :entries es
                         :children
-                        (vegeta--build-tree-1 es rest crumb))))
+                        (vegeta--build-tree-1 es sub-levels crumb))))
               (nreverse order))))
         (sort nodes
               (lambda (a b)

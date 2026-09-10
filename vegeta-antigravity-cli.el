@@ -236,7 +236,9 @@ Removes:
        :parse #'vegeta--agy-parse
        :visit #'vegeta--agy-visit
        :date-key #'vegeta--agy-date-key
-       :delete #'vegeta--agy-delete))
+       :delete #'vegeta--agy-delete
+       ;; Every agy entry is Gemini; skip the redundant model level.
+       :skip-levels '(model)))
 
 (provide 'vegeta-antigravity-cli)
 ;;; vegeta-antigravity-cli.el ends here

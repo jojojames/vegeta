@@ -335,7 +335,10 @@ before the full parse runs.  Falls back to mtime, then `unknown'."
        :parse #'vegeta--claude-parse
        :visit #'vegeta--claude-visit
        :date-key #'vegeta--claude-date-key
-       :delete #'vegeta--claude-delete))
+       :delete #'vegeta--claude-delete
+       ;; Every claude-cli entry is Claude; the model level would just
+       ;; wrap everything in a single `Claude (N)' node — noise.
+       :skip-levels '(model)))
 
 (provide 'vegeta-claude-cli)
 ;;; vegeta-claude-cli.el ends here
