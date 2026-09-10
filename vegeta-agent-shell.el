@@ -303,7 +303,7 @@ so the date is available deterministically without parsing the file."
 
 (vegeta-register-provider
  (list :id 'agent-shell
-       :name "agent-shell"
+       :name "Agent Shell"
        :list #'vegeta--agent-shell-list
        :parse #'vegeta--agent-shell-parse
        :visit #'vegeta--agent-shell-visit

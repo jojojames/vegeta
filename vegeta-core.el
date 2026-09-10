@@ -602,7 +602,7 @@ interactive CLIs work), starting in DIRECTORY."
 ;;
 ;; A provider is a plist with the keys:
 ;;   :id           symbol, e.g. `agent-shell'                          (required)
-;;   :name         display string, e.g. "agent-shell"                  (required)
+;;   :name         display string, e.g. "Agent Shell"                  (required)
 ;;   :list         () -> list of ENTRY plists                          (required)
 ;;   :parse        (ENTRY) -> META plist                               (required)
 ;;   :visit        (ENTRY) -> side-effect (opens/resumes)              (required)
@@ -1251,24 +1251,46 @@ Node shape: (:level LEVEL :key KEY :breadcrumb (KEYS...)
                         :children
                         (vegeta--build-tree-1 es sub-levels crumb))))
               (nreverse order))))
-        (sort nodes
-              (lambda (a b)
-                (let ((ma (vegeta--node-latest-mtime a))
-                      (mb (vegeta--node-latest-mtime b)))
-                  (cond
-                   ((and (null ma) (null mb))
-                    (string< (format "%s" (plist-get a :key))
-                             (format "%s" (plist-get b :key))))
-                   ((null ma) nil)
-                   ((null mb) t)
-                   (t (> ma mb))))))))))
+        (sort nodes #'vegeta--node-sort-lessp)))))
 
-(defun vegeta--node-latest-mtime (node)
-  "Return the newest mtime among entries in NODE."
-  (let ((mtimes (delq nil
-                      (mapcar (lambda (e) (plist-get e :mtime))
-                              (plist-get node :entries)))))
-    (and mtimes (apply #'max mtimes))))
+(defun vegeta--node-sort-key (node)
+  "Return the display-name sort key for NODE, lowercased."
+  (downcase
+   (format "%s"
+           (vegeta--display-name (plist-get node :level)
+                                 (plist-get node :key)
+                                 (plist-get node :entries)))))
+
+(defun vegeta--host-sort-lessp (a b)
+  "Return non-nil when host node A sorts before host node B.
+`localhost' always leads; remaining hosts sort alphabetically."
+  (let ((ka (plist-get a :key))
+        (kb (plist-get b :key)))
+    (cond
+     ((vegeta--local-host-p ka) (not (vegeta--local-host-p kb)))
+     ((vegeta--local-host-p kb) nil)
+     (t (string< (vegeta--node-sort-key a) (vegeta--node-sort-key b))))))
+
+(defun vegeta--date-sort-lessp (a b)
+  "Return non-nil when date node A sorts before date node B.
+Dates are newest first; a non-date key (e.g. \"unknown\") sorts last."
+  (let ((re "\\`[0-9]\\{4\\}-[0-9]\\{2\\}-[0-9]\\{2\\}\\'")
+        (ka (format "%s" (plist-get a :key)))
+        (kb (format "%s" (plist-get b :key))))
+    (cond
+     ((and (string-match-p re ka) (string-match-p re kb)) (string> ka kb))
+     ((string-match-p re ka) t)
+     ((string-match-p re kb) nil)
+     (t (string< ka kb)))))
+
+(defun vegeta--node-sort-lessp (a b)
+  "Return non-nil when node A sorts before sibling node B.
+Sections are alphabetical, with two exceptions: `localhost' leads the
+`host' level, and `date' sections are newest first."
+  (pcase (plist-get a :level)
+    ('host (vegeta--host-sort-lessp a b))
+    ('date (vegeta--date-sort-lessp a b))
+    (_     (string< (vegeta--node-sort-key a) (vegeta--node-sort-key b)))))
 
 ;;; Rendering
 
