@@ -49,7 +49,7 @@
       (let ((pending (list (cons base 0))))
         (while pending
           (pcase-let ((`(,directory . ,depth) (pop pending)))
-            (unless (file-symlink-p directory)
+            (unless (file-symlink-p (directory-file-name directory))
               (dolist (pair (condition-case nil
                                 (directory-files-and-attributes directory t "\\`[^.]" t)
                               (file-error nil)))
