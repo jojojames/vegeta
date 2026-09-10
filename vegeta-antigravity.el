@@ -313,6 +313,9 @@ so this is best-effort local cleanup."
        :visit #'vegeta--antigravity-visit
        :date-key #'vegeta--antigravity-date-key
        :delete #'vegeta--antigravity-delete
+       ;; `:visit' launches the local Antigravity IDE (there is no remote
+       ;; deep-link), so the provider is local-only.
+       :local-only t
        ;; Every IDE conversation is Gemini; skip the redundant model level.
        :skip-levels '(model)))
 

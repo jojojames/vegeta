@@ -290,7 +290,11 @@ so the date is available deterministically without parsing the file."
        :list #'vegeta--agent-shell-list
        :parse #'vegeta--agent-shell-parse
        :visit #'vegeta--agent-shell-visit
-       :date-key #'vegeta--agent-shell-date-key))
+       :date-key #'vegeta--agent-shell-date-key
+       ;; Discovery scans the *local* project list
+       ;; (`vegeta--project-roots') and `:visit' starts a local
+       ;; agent-shell, so this provider is local-only.
+       :local-only t))
 
 (provide 'vegeta-agent-shell)
 ;;; vegeta-agent-shell.el ends here

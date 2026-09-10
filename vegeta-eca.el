@@ -394,6 +394,9 @@ since there is no offline way to keep the index consistent."
        :visit #'vegeta--eca-visit
        :date-key #'vegeta--eca-date-key
        :delete #'vegeta--eca-delete
+       ;; `:list' shells out to the local `eca' binary and reads the
+       ;; local cache, so the provider is local-only.
+       :local-only t
        ;; Keep the model level: ECA chats span providers/models
        ;; (deepseek/..., anthropic/...), so grouping by model is useful.
        :open-transcript #'vegeta--eca-open-transcript))

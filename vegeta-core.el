@@ -119,16 +119,20 @@ Merged with `project-known-project-roots' and
   "Hide projects with no entries from the sidebar."
   :type 'boolean)
 
-(defcustom vegeta-grouping '(package repo model date)
+(defcustom vegeta-grouping '(host package repo model date)
   "Grouping levels for the sidebar tree, outermost first.
 Each element is one of the recognized levels:
+  `host'    — group by the machine the chat was found on (see
+              `vegeta-hosts'); skipped automatically when only
+              `localhost' is configured
   `package' — group by provider (e.g. agent-shell, Claude CLI)
   `repo'    — group by project/repository root
   `model'   — group by agent/model name (Claude, Codex, ...)
   `date'    — group by YYYY-MM-DD (from parsed timestamp or file mtime)
 
 An empty list produces a flat listing sorted by date."
-  :type '(repeat (choice (const package)
+  :type '(repeat (choice (const host)
+                         (const package)
                          (const repo)
                          (const model)
                          (const date))))
@@ -138,6 +142,32 @@ An empty list produces a flat listing sorted by date."
   "Provider ids to include in the sidebar.
 See `vegeta-providers' for available providers."
   :type '(repeat symbol))
+
+(defcustom vegeta-hosts
+  '((localhost . all))
+  "Hosts to query for chats, and which providers to query on each.
+An alist of (HOST . PROVIDERS):
+
+  HOST      \"localhost\" for the local machine, or an SSH/Tramp
+            target such as \"192.168.1.120\" or \"user@box.lan\".
+  PROVIDERS a list of provider ids to query on that host, or the
+            symbol `all' for every `vegeta-enabled-providers' entry.
+
+For example:
+
+  (setq vegeta-hosts
+        `((localhost . all)
+          (\"192.168.1.120\" . (claude-cli antigravity-cli))))
+
+Remote hosts are reached through Tramp (`/ssh:HOST:'), so neither Emacs
+nor vegeta needs to be installed on the host — only SSH access and the
+provider's own data.  A provider that cannot operate remotely declares
+`:local-only' and is skipped on remote hosts (e.g. one that shells out
+to a local binary).  Leaving this at its default queries only the local
+machine and changes nothing for existing users."
+  :type '(alist :key-type (choice (string :tag "Host")
+                                  (symbol :tag "Host name"))
+                :value-type (choice (const all) (repeat symbol))))
 
 (defcustom vegeta-terminal-function nil
   "Function to run PROGRAM with ARGS in a terminal at DIRECTORY.
@@ -214,6 +244,10 @@ Values:
   '((t :inherit shadow))
   "Face for un-parsed placeholder metadata.")
 
+(defface vegeta-host-face
+  '((t :inherit font-lock-function-name-face :weight bold))
+  "Face for host header rows (see `vegeta-hosts').")
+
 ;;; State
 
 (defconst vegeta--cache-schema 6
@@ -248,6 +282,12 @@ Used for O(1) duplicate suppression when queuing.")
   "Discovery result cached across `vegeta--redraw' calls.
 Cleared by `vegeta-refresh' so background parse ticks don't
 re-scan the filesystem on every chunk.")
+
+(defvar vegeta--current-host "localhost"
+  "Host currently being queried.
+Bound to the target host while a provider's hooks run so file paths
+resolve locally or over Tramp, and read by `vegeta--launch-terminal'
+to decide between a local and an ssh session.")
 
 (defvar vegeta--async-pending 0
   "Number of async worker batches still in flight.
@@ -353,6 +393,110 @@ Uses the shortest trailing path suffix that is unique across ROOTS."
                  result)))
     result))
 
+;;; Hosts
+;;
+;; A "host" is where a provider's data lives: "localhost" (the local
+;; filesystem) or an SSH target.  Remote hosts are read through Tramp,
+;; so a provider only needs to expose its data roots via `:host-dirs'
+;; (an alist of (VARIABLE . "~/relative/path")); vegeta rebinds those
+;; variables to `/ssh:HOST:~/...' roots while the provider runs, and the
+;; provider's existing file operations then transparently go over SSH.
+
+(defvar vegeta-providers)
+(defconst vegeta--local-host "localhost"
+  "Name used for the local machine in `vegeta-hosts'.")
+
+(defun vegeta--host-name (host)
+  "Return HOST as a normalized string."
+  (cond ((symbolp host) (symbol-name host))
+        ((stringp host) host)
+        (t (format "%s" host))))
+
+(defun vegeta--local-host-p (host)
+  "Return non-nil when HOST names the local machine."
+  (member (vegeta--host-name host) '("localhost" "127.0.0.1" "::1")))
+
+(defun vegeta--hosts ()
+  "Return the configured hosts as a list of (HOST-NAME . PROVIDERS).
+Falls back to localhost/all when `vegeta-hosts' is nil or empty."
+  (let ((hosts (if vegeta-hosts vegeta-hosts '((localhost . all)))))
+    (mapcar (lambda (pair)
+              (cons (vegeta--host-name (car pair)) (cdr pair)))
+            hosts)))
+
+(defun vegeta--remote-hosts ()
+  "Return the configured non-local host names."
+  (seq-remove #'vegeta--local-host-p (mapcar #'car (vegeta--hosts))))
+
+(defun vegeta--providers-for-host (host-spec)
+  "Return the enabled provider plists to query for HOST-SPEC.
+HOST-SPEC is a list of provider ids or the symbol `all'."
+  (let ((ids (if (eq host-spec 'all)
+                 vegeta-enabled-providers
+               host-spec)))
+    (delq nil
+          (mapcar (lambda (id) (alist-get id vegeta-providers))
+                  (seq-filter (lambda (id) (memq id vegeta-enabled-providers))
+                              ids)))))
+
+(defun vegeta--entry-host (entry)
+  "Return ENTRY's host as a string, defaulting to localhost."
+  (vegeta--host-name (or (plist-get entry :host) vegeta--local-host)))
+
+(defun vegeta--host-tramp-prefix (host)
+  "Return the Tramp prefix for remote HOST, e.g. \"/ssh:box:\"."
+  (format "/ssh:%s:" (vegeta--host-name host)))
+
+(defun vegeta--host-join (host path)
+  "Resolve PATH for HOST.
+For localhost PATH is expanded against the local home; for a remote
+host it becomes a Tramp `/ssh:HOST:PATH' name.  PATH is expected to be
+`~'-relative (so it resolves to the remote home), though an absolute
+remote path works too."
+  (if (vegeta--local-host-p host)
+      (expand-file-name path)
+    (let ((prefix (vegeta--host-tramp-prefix host)))
+      (if (string-prefix-p prefix path) path (concat prefix path)))))
+
+(defun vegeta--hostify (host path)
+  "Return PATH tramp-qualified for a remote HOST, or unchanged locally.
+Already-qualified paths are returned as-is; non-string values (nil,
+numbers) pass through."
+  (cond
+   ((null path) nil)
+   ((not (stringp path)) path)
+   ((vegeta--local-host-p host) path)
+   ((string-prefix-p "/ssh:" path) path)
+   (t (vegeta--host-join host path))))
+
+(defun vegeta--unhostify (host path)
+  "Strip HOST's Tramp prefix from PATH, yielding the host-native path."
+  (if (and (stringp path)
+           (string-prefix-p (vegeta--host-tramp-prefix host) path))
+      (substring path (length (vegeta--host-tramp-prefix host)))
+    path))
+
+(defun vegeta--call-with-host (provider host fn &rest args)
+  "Call FN (a provider hook) with ARGS, resolving paths for HOST.
+For a remote HOST the provider's `:host-dirs' variables are bound to
+host-qualified roots so its file operations run over Tramp; for
+localhost the user's configured values are used untouched.  Errors from
+an unreachable remote host are reported once and yield nil."
+  (let ((vegeta--current-host host))
+    (if (vegeta--local-host-p host)
+        (apply fn args)
+      (condition-case err
+          (let ((dirs (delq nil (plist-get provider :host-dirs))))
+            (if dirs
+                (cl-progv (mapcar #'car dirs)
+                          (mapcar (lambda (p) (vegeta--host-join host (cdr p)))
+                                  dirs)
+                  (apply fn args))
+              (apply fn args)))
+        (error
+         (message "vegeta: host %s: %s" host (error-message-string err))
+         nil)))))
+
 ;;; Time utilities
 
 (defun vegeta--iso-to-seconds (str)
@@ -364,8 +508,14 @@ Accepts both agent-shell's local-time format and Claude's ISO UTC form."
 
 ;;; Terminal launcher
 
-(defun vegeta--launch-terminal (name program args directory)
-  "Launch PROGRAM ARGS in a terminal buffer named NAME at DIRECTORY."
+(defcustom vegeta-remote-ssh-args '()
+  "Extra arguments passed to `ssh' when launching a remote host's chat.
+The host and the remote command are appended after these."
+  :type '(repeat string)
+  :group 'vegeta)
+
+(defun vegeta--pop-terminal (name program args directory)
+  "Show PROGRAM ARGS in a terminal buffer named NAME at DIRECTORY."
   (if vegeta-terminal-function
       (funcall vegeta-terminal-function name program args directory)
     (cond
@@ -386,6 +536,27 @@ Accepts both agent-shell's local-time format and Claude's ISO UTC form."
         (term (mapconcat #'shell-quote-argument
                          (cons program args) " ")))))))
 
+(defun vegeta--launch-terminal (name program args directory)
+  "Launch PROGRAM ARGS in a terminal buffer named NAME at DIRECTORY.
+DIRECTORY is a path on `vegeta--current-host'; when that host is
+remote, PROGRAM is run there through `ssh -t' (a login shell so
+interactive CLIs work), starting in DIRECTORY."
+  (let ((host vegeta--current-host))
+    (if (vegeta--local-host-p host)
+        (vegeta--pop-terminal name program args
+                              (file-name-as-directory directory))
+      (let* ((native-dir (vegeta--unhostify host directory))
+             (remote-command
+              (format "cd %s && exec %s"
+                      (shell-quote-argument native-dir)
+                      (mapconcat #'shell-quote-argument
+                                 (cons program args) " "))))
+        (vegeta--pop-terminal
+         name "ssh"
+         (append vegeta-remote-ssh-args
+                 (list "-t" host remote-command))
+         default-directory)))))
+
 ;;; Provider protocol
 ;;
 ;; A provider is a plist with the keys:
@@ -399,6 +570,13 @@ Accepts both agent-shell's local-time format and Claude's ISO UTC form."
 ;;   :open-transcript (ENTRY) -> buffer of a rendered transcript       (optional)
 ;;                 used by `vegeta-open-transcript' before falling
 ;;                 back to opening the entry's `:id' file
+;;   :host-dirs    alist of (VARIABLE . "~/relative/path")            (optional)
+;;                 data roots; rebound to `/ssh:HOST:...' so the
+;;                 provider can run against a remote `vegeta-hosts'
+;;                 entry over Tramp
+;;   :local-only   t when the provider cannot run on a remote host    (optional)
+;;                 (e.g. it shells out to a local binary); such a
+;;                 provider is skipped for remote hosts
 ;;   :skip-levels  list of level symbols to omit from grouping for
 ;;                 this provider's entries (e.g. `(model)' for a
 ;;                 single-agent provider like `claude-cli')            (optional)
@@ -406,6 +584,7 @@ Accepts both agent-shell's local-time format and Claude's ISO UTC form."
 ;; An ENTRY is a plist with:
 ;;   :provider SYMBOL             (provider id)
 ;;   :id       STRING             (globally unique; usually the source file path)
+;;   :host     STRING             (host it was found on; default "localhost")
 ;;   :repo     STRING or nil      (project root path)
 ;;   :agent    STRING or nil      (fast-known agent/model label; else parsed)
 ;;   :mtime    FLOAT              (for sorting and cache validation)
@@ -478,7 +657,10 @@ per-session env dir, an index entry, etc.) should implement `:delete'."
   (or (vegeta--cached-meta entry)
       (let* ((provider (vegeta--entry-provider entry))
              (parser (plist-get provider :parse))
-             (meta (and parser (funcall parser entry))))
+             (meta (and parser
+                        (vegeta--call-with-host provider
+                                                (vegeta--entry-host entry)
+                                                parser entry))))
         (vegeta--put-cache entry meta)
         meta)))
 
@@ -635,12 +817,14 @@ BATCH is the entry list to parse; LIB-DIR is the directory containing
         (lambda (entry)
           (let* ((prov (alist-get (plist-get entry :provider)
                                   vegeta-providers))
-                 (parser (plist-get prov :parse)))
+                 (parser (plist-get prov :parse))
+                 (host (or (plist-get entry :host) "localhost")))
             ;; Return a compact tuple; the caller writes it into
             ;; `vegeta--parse-cache' with the current schema version.
             (list (plist-get entry :id)
                   (plist-get entry :mtime)
-                  (and parser (funcall parser entry)))))
+                  (and parser
+                       (vegeta--call-with-host prov host parser entry)))))
         ',batch))))
 
 (defun vegeta--async-callback (results)
@@ -719,18 +903,47 @@ the queue but not parsed due to an abort gets requeued."
 ;;; Discovery aggregation
 
 (defun vegeta--all-entries ()
-  "Return a flat list of entries from every enabled provider.
+  "Return a flat list of entries from every provider on every host.
 Result is cached in `vegeta--entries-cache' until the next
 `vegeta-refresh' clears it.  Background parse ticks trigger redraws
 that call this repeatedly; without the cache each tick would re-scan
-every project's transcripts directory and every Claude project dir."
+every project's transcripts directory and every Claude project dir.
+
+Entries are gathered per (host, provider) pair from `vegeta-hosts' and
+tagged with their `:host'; remote hosts are read over Tramp."
   (or vegeta--entries-cache
-      (let (all)
-        (dolist (p (vegeta--enabled-providers))
-          (let ((lister (plist-get p :list)))
-            (when lister
-              (setq all (append all (funcall lister))))))
-        (setq vegeta--entries-cache all))))
+      (setq vegeta--entries-cache
+            (let (all)
+              (dolist (pair (vegeta--hosts))
+                (let ((host (car pair)))
+                  (dolist (provider (vegeta--providers-for-host (cdr pair)))
+                    (setq all (append all
+                                      (vegeta--list-provider provider host))))))
+              all))))
+
+(defun vegeta--list-provider (provider host)
+  "Return PROVIDER's entries for HOST, tagged and host-qualified.
+A provider flagged `:local-only' is skipped on remote hosts."
+  (let ((lister (plist-get provider :list)))
+    (cond
+     ((null lister) nil)
+     ((and (not (vegeta--local-host-p host))
+           (plist-get provider :local-only))
+      (message "vegeta: skipping local-only provider %s on host %s"
+               (plist-get provider :id) host)
+      nil)
+     (t
+      (mapcar (lambda (entry) (vegeta--tag-host-entry entry host))
+              (vegeta--call-with-host provider host lister))))))
+
+(defun vegeta--tag-host-entry (entry host)
+  "Attach HOST to ENTRY and tramp-qualify its paths for a remote host."
+  (plist-put entry :host host)
+  (when (not (vegeta--local-host-p host))
+    (plist-put entry :id (vegeta--hostify host (plist-get entry :id)))
+    (when-let* ((repo (plist-get entry :repo)))
+      (plist-put entry :repo (vegeta--hostify host repo))))
+  entry)
 
 ;;; Entry accessors (consult cache when available)
 
@@ -825,11 +1038,15 @@ whether the entry has been parsed yet — otherwise entries drift between
 groups as background parsing completes."
   (let* ((provider (vegeta--entry-provider entry))
          (fn (and provider (plist-get provider :date-key))))
-    (funcall (or fn #'vegeta--default-date-key) entry)))
+    (vegeta--call-with-host provider
+                            (vegeta--entry-host entry)
+                            (or fn #'vegeta--default-date-key)
+                            entry)))
 
 (defun vegeta--group-key (entry level)
   "Return the group key for ENTRY at LEVEL (a symbol)."
   (pcase level
+    ('host    (vegeta--entry-host entry))
     ('package (plist-get entry :provider))
     ('repo    (or (plist-get entry :repo) "(no repo)"))
     ('model   (or (vegeta--entry-agent entry) "?"))
@@ -913,6 +1130,7 @@ Node shape: (:level LEVEL :key KEY :breadcrumb (KEYS...)
 (defun vegeta--display-name (level key entries)
   "Return the display string for a group header at LEVEL with KEY."
   (pcase level
+    ('host    (or key vegeta--local-host))
     ('package
      (let ((p (alist-get key vegeta-providers)))
        (or (and p (plist-get p :name)) (symbol-name key))))
@@ -931,11 +1149,20 @@ Node shape: (:level LEVEL :key KEY :breadcrumb (KEYS...)
 (defun vegeta--face-for-level (level)
   "Return the face used for a header at LEVEL."
   (pcase level
+    ('host    'vegeta-host-face)
     ('package 'vegeta-package-face)
     ('repo    'vegeta-project-face)
     ('model   'vegeta-agent-face)
     ('date    'vegeta-date-face)
     (_        'vegeta-project-face)))
+
+(defun vegeta--effective-levels (levels)
+  "Return LEVELS with `host' dropped when only localhost is configured.
+Keeps existing single-machine setups from growing a lone `localhost'
+node; the level reappears as soon as a remote host is added."
+  (if (vegeta--remote-hosts)
+      levels
+    (seq-remove (lambda (l) (eq l 'host)) levels)))
 
 (defun vegeta--render-group-header (node depth entries-at-node)
   "Insert a group header line for NODE at DEPTH.
@@ -1049,8 +1276,9 @@ with an ellipsis so multi-byte characters are counted correctly."
         (let ((renamed (plist-get meta :renamed))
               (ai-title (plist-get meta :ai-title))
               (first-prompt (plist-get meta :first-prompt)))
-          (format "%s\nProvider: %s\nAgent: %s\nSession: %s\nCwd: %s%s%s%s"
+          (format "%s\nHost: %s\nProvider: %s\nAgent: %s\nSession: %s\nCwd: %s%s%s%s"
                   id
+                  (vegeta--entry-host entry)
                   (plist-get entry :provider)
                   (or (plist-get meta :agent) "?")
                   (or (plist-get meta :session-id) "(none)")
@@ -1117,7 +1345,7 @@ with an ellipsis so multi-byte characters are counted correctly."
              e 0 (gethash (plist-get e :id) vegeta--marks)))))
        (t
         (vegeta--render-tree
-         (vegeta--build-tree entries vegeta-grouping)
+         (vegeta--build-tree entries (vegeta--effective-levels vegeta-grouping))
          0)))
       (goto-char (point-min))
       (cond
@@ -1247,7 +1475,8 @@ the raw transcript file is opened instead."
         (unless visitor
           (user-error "Provider %s has no :visit function"
                       (plist-get entry :provider)))
-        (funcall visitor entry))))
+        (vegeta--call-with-host provider (vegeta--entry-host entry)
+                                visitor entry))))
    (t (user-error "Nothing at point"))))
 
 (defun vegeta-mouse-visit (event)
@@ -1363,7 +1592,10 @@ Failures on individual entries are reported but don't abort the batch."
                               #'vegeta--default-delete)))
             (condition-case err
                 (progn
-                  (when entry (funcall deleter entry))
+                  (when entry
+                    (vegeta--call-with-host provider
+                                            (vegeta--entry-host entry)
+                                            deleter entry))
                   (cl-incf ok))
               (error
                (cl-incf fail)

@@ -336,6 +336,10 @@ before the full parse runs.  Falls back to mtime, then `unknown'."
        :visit #'vegeta--claude-visit
        :date-key #'vegeta--claude-date-key
        :delete #'vegeta--claude-delete
+       ;; Data roots, in `~'-relative form, so vegeta can point them at a
+       ;; remote host's `/ssh:HOST:~/...' when listed there.
+       :host-dirs '((vegeta-claude-cli-projects-dir . "~/.claude/projects/")
+                    (vegeta-claude-cli-session-env-dir . "~/.claude/session-env/"))
        ;; Every claude-cli entry is Claude; the model level would just
        ;; wrap everything in a single `Claude (N)' node — noise.
        :skip-levels '(model)))

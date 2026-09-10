@@ -237,6 +237,12 @@ Removes:
        :visit #'vegeta--agy-visit
        :date-key #'vegeta--agy-date-key
        :delete #'vegeta--agy-delete
+       ;; Data roots, in `~'-relative form, for remote (`vegeta-hosts')
+       ;; listing over Tramp.
+       :host-dirs '((vegeta-antigravity-cli-brain-dir
+                     . "~/.gemini/antigravity-cli/brain/")
+                    (vegeta-antigravity-cli-conversations-dir
+                     . "~/.gemini/antigravity-cli/conversations/"))
        ;; Every agy entry is Gemini; skip the redundant model level.
        :skip-levels '(model)))
 
