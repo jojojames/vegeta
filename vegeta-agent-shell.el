@@ -199,6 +199,16 @@ within 60 seconds of STARTED-STR."
 
 (defun vegeta--agent-shell-visit (entry)
   "Visit an agent-shell ENTRY.
+On the local host the session is resumed (see
+`vegeta--agent-shell--visit-local').  On a remote `vegeta-hosts'
+machine an agent-shell session cannot be resumed, so the remote
+transcript is opened read-only instead."
+  (if (vegeta--local-host-p vegeta--current-host)
+      (vegeta--agent-shell--visit-local entry)
+    (vegeta--pop-to (find-file-noselect (plist-get entry :id)))))
+
+(defun vegeta--agent-shell--visit-local (entry)
+  "Resume or start an agent-shell session for ENTRY on the local host.
 When `:session-id' is known (either from the transcript header or from
 parse-time Claude CLI cross-reference), resume that session — or jump
 to its live buffer if one is already open.
@@ -291,10 +301,11 @@ so the date is available deterministically without parsing the file."
        :parse #'vegeta--agent-shell-parse
        :visit #'vegeta--agent-shell-visit
        :date-key #'vegeta--agent-shell-date-key
-       ;; Discovery scans the *local* project list
-       ;; (`vegeta--project-roots') and `:visit' starts a local
-       ;; agent-shell, so this provider is local-only.
-       :local-only t))
+       ;; Discovery is driven by `vegeta--project-roots', which resolves
+       ;; to `vegeta-extra-project-roots' on a remote host — so a stray
+       ;; directory (local or remote) can be targeted directly.  On a
+       ;; remote host `:visit' opens the transcript instead of resuming.
+       ))
 
 (provide 'vegeta-agent-shell)
 ;;; vegeta-agent-shell.el ends here

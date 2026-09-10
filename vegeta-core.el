@@ -111,8 +111,20 @@ in-process idle-timer parser."
 
 (defcustom vegeta-extra-project-roots nil
   "Additional project roots to scan.
-Merged with `project-known-project-roots' and
-`projectile-known-projects'."
+Stray directories that the automatic project checks
+\(`project-known-project-roots', Projectile, live agent-shell buffers)
+do not catch — e.g. \"/bebe/script/af\".
+
+On the local host these are merged with the detected project roots.  On
+a remote `vegeta-hosts' machine they become the only roots scanned (the
+project list of a remote machine is unknown), each resolved on that
+host through Tramp.  So one entry both adds a local stray root and lets
+a remote host be targeted directly:
+
+  (setq vegeta-extra-project-roots (list \"/bebe/script/af\"))
+
+Only project-root based providers consume these roots; today that is
+`agent-shell' (which looks for `<root>/.agent-shell/transcripts/')."
   :type '(repeat directory))
 
 (defcustom vegeta-collapse-empty-projects t
@@ -334,18 +346,31 @@ event finds the displaying window at the width already rendered.")
            (agent-shell-buffers)))))
 
 (defun vegeta--project-roots ()
-  "Return the union of known project roots, deduplicated and normalized."
-  (let ((roots (append
-                (when (fboundp 'project-known-project-roots)
-                  (project-known-project-roots))
-                (when (bound-and-true-p projectile-known-projects)
-                  projectile-known-projects)
-                (vegeta--live-agent-shell-roots)
-                vegeta-extra-project-roots)))
-    (thread-last roots
+  "Return the project roots to scan for `vegeta--current-host'.
+On the local host, the union of the detected project roots
+\(`project-known-project-roots', Projectile, live agent-shell buffers)
+plus `vegeta-extra-project-roots'.  On a remote host, whose own project
+list is unknown, only `vegeta-extra-project-roots' — each resolved on
+that host so the scan runs over Tramp."
+  (if (vegeta--local-host-p vegeta--current-host)
+      (let ((roots (append
+                    (when (fboundp 'project-known-project-roots)
+                      (project-known-project-roots))
+                    (when (bound-and-true-p projectile-known-projects)
+                      projectile-known-projects)
+                    (vegeta--live-agent-shell-roots)
+                    vegeta-extra-project-roots)))
+        (thread-last roots
+                     (mapcar (lambda (r)
+                               (when r
+                                 (expand-file-name (file-name-as-directory r)))))
+                     (delq nil)
+                     (seq-uniq)))
+    (thread-last vegeta-extra-project-roots
                  (mapcar (lambda (r)
                            (when r
-                             (expand-file-name (file-name-as-directory r)))))
+                             (file-name-as-directory
+                              (vegeta--host-join vegeta--current-host r)))))
                  (delq nil)
                  (seq-uniq))))
 
