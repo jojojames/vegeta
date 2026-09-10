@@ -22,6 +22,9 @@
 (declare-function projectile-known-projects "projectile")
 (defvar projectile-known-projects)
 
+(declare-function agent-shell-buffers "agent-shell")
+(declare-function agent-shell-cwd "agent-shell")
+
 (declare-function evil-define-key* "evil-core")
 (declare-function evil-make-overriding-map "evil-core")
 (declare-function evil-goto-first-line "evil-commands")
@@ -254,6 +257,19 @@ When it hits zero after a refresh, the persisted cache flushes to disk.")
 
 ;;; Project roots
 
+(defun vegeta--live-agent-shell-roots ()
+  "Return project roots used by live agent-shell buffers."
+  (when (fboundp 'agent-shell-buffers)
+    (delq nil
+          (mapcar
+           (lambda (buffer)
+             (when (buffer-live-p buffer)
+               (with-current-buffer buffer
+                 (ignore-errors
+                   (file-name-as-directory
+                    (expand-file-name (agent-shell-cwd)))))))
+           (agent-shell-buffers)))))
+
 (defun vegeta--project-roots ()
   "Return the union of known project roots, deduplicated and normalized."
   (let ((roots (append
@@ -261,6 +277,7 @@ When it hits zero after a refresh, the persisted cache flushes to disk.")
                   (project-known-project-roots))
                 (when (bound-and-true-p projectile-known-projects)
                   projectile-known-projects)
+                (vegeta--live-agent-shell-roots)
                 vegeta-extra-project-roots)))
     (thread-last roots
                  (mapcar (lambda (r)
