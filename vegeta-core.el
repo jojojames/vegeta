@@ -305,6 +305,12 @@ to decide between a local and an ssh session.")
   "Number of async worker batches still in flight.
 When it hits zero after a refresh, the persisted cache flushes to disk.")
 
+(defvar vegeta--host-jobs 0
+  "Number of background remote-host listing jobs still in flight.")
+
+(defvar vegeta--pending-hosts nil
+  "Hosts with a background listing job currently in flight.")
+
 (declare-function async-start "async")
 
 (defvar-local vegeta--marks nil
@@ -501,6 +507,16 @@ numbers) pass through."
       (substring path (length (vegeta--host-tramp-prefix host)))
     path))
 
+(defun vegeta--hostify-meta (meta host)
+  "Tramp-qualify path-valued fields of META for a remote HOST.
+Providers parse native paths out of a remote file (e.g. a transcript's
+recorded cwd), so hostify them here to keep downstream file operations
+correct.  Returns META."
+  (when (and meta (not (vegeta--local-host-p host)))
+    (when-let* ((cwd (plist-get meta :cwd)))
+      (plist-put meta :cwd (vegeta--hostify host cwd))))
+  meta)
+
 (defun vegeta--call-with-host (provider host fn &rest args)
   "Call FN (a provider hook) with ARGS, resolving paths for HOST.
 For a remote HOST the provider's `:host-dirs' variables are bound to
@@ -681,11 +697,12 @@ per-session env dir, an index entry, etc.) should implement `:delete'."
   "Return metadata for ENTRY, parsing synchronously on cache miss."
   (or (vegeta--cached-meta entry)
       (let* ((provider (vegeta--entry-provider entry))
+             (host (vegeta--entry-host entry))
              (parser (plist-get provider :parse))
              (meta (and parser
-                        (vegeta--call-with-host provider
-                                                (vegeta--entry-host entry)
-                                                parser entry))))
+                        (vegeta--hostify-meta
+                         (vegeta--call-with-host provider host parser entry)
+                         host))))
         (vegeta--put-cache entry meta)
         meta)))
 
@@ -751,11 +768,15 @@ skipped so parser changes invalidate stale data automatically."
            #'vegeta--cache-flush-tick))))
 
 (defun vegeta--cache-flush-tick ()
-  "Idle-timer tick: flush cache to disk when dirty and parsing has drained."
+  "Idle-timer tick: flush cache to disk when dirty and work has drained."
   (when (and vegeta--cache-dirty
-             (null vegeta--parse-queue))
+             (null vegeta--parse-queue)
+             (zerop vegeta--host-jobs))
     (vegeta--cache-save))
-  (unless vegeta--cache-dirty
+  ;; Stop rescheduling once nothing is dirty and no async work remains.
+  (when (and (not vegeta--cache-dirty)
+             (null vegeta--parse-queue)
+             (zerop vegeta--host-jobs))
     (when (timerp vegeta--cache-flush-timer)
       (cancel-timer vegeta--cache-flush-timer))
     (setq vegeta--cache-flush-timer nil)))
@@ -849,7 +870,9 @@ BATCH is the entry list to parse; LIB-DIR is the directory containing
             (list (plist-get entry :id)
                   (plist-get entry :mtime)
                   (and parser
-                       (vegeta--call-with-host prov host parser entry)))))
+                       (vegeta--hostify-meta
+                        (vegeta--call-with-host prov host parser entry)
+                        host)))))
         ',batch))))
 
 (defun vegeta--async-callback (results)
@@ -879,16 +902,113 @@ BATCH is the entry list to parse; LIB-DIR is the directory containing
   (async-start (vegeta--async-worker-form batch lib-dir)
                #'vegeta--async-callback))
 
+(defun vegeta--lib-dir ()
+  "Return the directory holding `vegeta-core', for async workers."
+  (file-name-directory
+   (or (locate-library "vegeta-core")
+       (error "vegeta-core.el not on load-path"))))
+
 (defun vegeta--start-async-parse ()
   "Dispatch the current parse queue across `vegeta-async-workers'."
   (let* ((queue vegeta--parse-queue)
-         (lib-dir (file-name-directory (or (locate-library "vegeta-core")
-                                           (error "vegeta-core.el not on load-path")))))
+         (lib-dir (vegeta--lib-dir)))
     (setq vegeta--parse-queue nil)
     (clrhash vegeta--parse-queued-ids)
     (dolist (batch (vegeta--split-list queue vegeta-async-workers))
       (when batch
         (vegeta--dispatch-async-batch batch lib-dir)))))
+
+(defun vegeta--maybe-start-parse ()
+  "Start parsing the queue, in background workers when available."
+  (cond
+   ((null vegeta--parse-queue) nil)
+   ((vegeta--async-available-p) (vegeta--start-async-parse))
+   (t (vegeta--start-parse-timer))))
+
+;;; Async host listing
+;;
+;; Local hosts are listed synchronously (fast).  Remote hosts are listed
+;; in `async' subprocesses so a slow or unreachable machine cannot block
+;; the refresh; results merge into `vegeta--entries-cache' and redraw the
+;; sidebar as they arrive.
+
+(defun vegeta--async-host-form (host provider-ids lib-dir extra-roots)
+  "Return the worker lambda that lists HOST's PROVIDER-IDS.
+LIB-DIR is where `vegeta-core.el' lives; EXTRA-ROOTS is
+`vegeta-extra-project-roots' so project-root providers can resolve
+their roots on HOST over Tramp."
+  (let ((modules vegeta-async-provider-modules))
+    `(lambda ()
+       (setq load-path (cons ,lib-dir load-path))
+       (require 'vegeta-core)
+       (dolist (m ',modules)
+         (require m))
+       (condition-case err
+           (let ((vegeta--current-host ,host)
+                 (vegeta-extra-project-roots ',extra-roots))
+             (let (all)
+               (dolist (id ',provider-ids)
+                 (let ((prov (alist-get id vegeta-providers)))
+                   (when (and prov (plist-get prov :list))
+                     (setq all (append all
+                                       (vegeta--call-with-host
+                                        prov ,host (plist-get prov :list)))))))
+               (mapcar (lambda (entry)
+                         (vegeta--tag-host-entry entry ,host))
+                       all)))
+         (error
+          (message "vegeta: host job %s failed: %S" ,host err)
+          nil)))))
+
+(defun vegeta--dispatch-host-job (host providers)
+  "Start a background listing job for HOST's PROVIDERS."
+  (let ((ids (delq nil (mapcar (lambda (p) (plist-get p :id)) providers))))
+    (cl-incf vegeta--host-jobs)
+    (push host vegeta--pending-hosts)
+    (async-start
+     (vegeta--async-host-form host ids (vegeta--lib-dir)
+                              vegeta-extra-project-roots)
+     (lambda (results) (vegeta--host-callback host results)))))
+
+(defun vegeta--host-callback (host results)
+  "Merge RESULTS from HOST's listing job, then redraw."
+  (setq vegeta--pending-hosts (delete host vegeta--pending-hosts))
+  (setq vegeta--host-jobs (max 0 (1- vegeta--host-jobs)))
+  (when (listp results)
+    (setq vegeta--entries-cache (append vegeta--entries-cache results))
+    (vegeta--queue-uncached results)
+    (vegeta--redraw-all-sidebars))
+  (when (zerop vegeta--host-jobs)
+    (vegeta--maybe-start-parse)
+    (unless (timerp vegeta--cache-flush-timer)
+      (setq vegeta--cache-flush-timer
+            (run-with-idle-timer vegeta-cache-flush-idle-delay t
+                                 #'vegeta--cache-flush-tick)))))
+
+(defun vegeta--remote-providers (host-spec)
+  "Return the non-`:local-only' enabled providers for HOST-SPEC."
+  (seq-remove (lambda (p) (plist-get p :local-only))
+              (vegeta--providers-for-host host-spec)))
+
+(defun vegeta--start-host-jobs ()
+  "Dispatch a background listing job for each remote host."
+  (dolist (pair (vegeta--hosts))
+    (let ((host (car pair)))
+      (unless (or (vegeta--local-host-p host)
+                  (member host vegeta--pending-hosts))
+        (let ((providers (vegeta--remote-providers (cdr pair))))
+          (when providers
+            (vegeta--dispatch-host-job host providers)))))))
+
+(defun vegeta--start-host-jobs-sync ()
+  "List each remote host's providers synchronously (no `async')."
+  (dolist (pair (vegeta--hosts))
+    (let ((host (car pair)))
+      (unless (vegeta--local-host-p host)
+        (dolist (provider (vegeta--remote-providers (cdr pair)))
+          (setq vegeta--entries-cache
+                (append vegeta--entries-cache
+                        (vegeta--list-provider provider host))))))))
 
 (defun vegeta--parse-tick ()
   "Parse the next chunk of entries, then redraw affected sidebars.
@@ -927,24 +1047,27 @@ the queue but not parsed due to an abort gets requeued."
 
 ;;; Discovery aggregation
 
-(defun vegeta--all-entries ()
-  "Return a flat list of entries from every provider on every host.
-Result is cached in `vegeta--entries-cache' until the next
-`vegeta-refresh' clears it.  Background parse ticks trigger redraws
-that call this repeatedly; without the cache each tick would re-scan
-every project's transcripts directory and every Claude project dir.
+(defun vegeta--local-host-entries ()
+  "Return entries for the local machine from its configured providers.
+Iterates the `localhost' entries of `vegeta-hosts' (which may restrict
+providers), running each provider in-process."
+  (let (all)
+    (dolist (pair (vegeta--hosts))
+      (when (vegeta--local-host-p (car pair))
+        (dolist (provider (vegeta--providers-for-host (cdr pair)))
+          (setq all (append all
+                            (vegeta--list-provider provider (car pair)))))))
+    all))
 
-Entries are gathered per (host, provider) pair from `vegeta-hosts' and
-tagged with their `:host'; remote hosts are read over Tramp."
+(defun vegeta--all-entries ()
+  "Return the current discovery result.
+Populated by `vegeta-refresh' — local entries synchronously, remote
+hosts merged in as their background jobs finish — and cached in
+`vegeta--entries-cache' until the next refresh.  When unset, computes
+only the local entries so a redraw before the first refresh still
+works."
   (or vegeta--entries-cache
-      (setq vegeta--entries-cache
-            (let (all)
-              (dolist (pair (vegeta--hosts))
-                (let ((host (car pair)))
-                  (dolist (provider (vegeta--providers-for-host (cdr pair)))
-                    (setq all (append all
-                                      (vegeta--list-provider provider host))))))
-              all))))
+      (setq vegeta--entries-cache (vegeta--local-host-entries))))
 
 (defun vegeta--list-provider (provider host)
   "Return PROVIDER's entries for HOST, tagged and host-qualified.
@@ -1640,24 +1763,29 @@ Failures on individual entries are reported but don't abort the batch."
   "Rescan providers and redraw.
 On the first invocation of an Emacs session, the persisted cache from
 `vegeta-cache-file' is loaded before the scan so entries with fresh
-cached metadata render immediately.  Uncached entries are parsed in
-subprocess workers when the `async' library is installed and
-`vegeta-async-workers' > 0; otherwise they fall through to the
-in-process idle-timer parser."
+cached metadata render immediately.
+
+Local hosts are listed synchronously (fast).  Remote `vegeta-hosts'
+machines are listed in background subprocesses so a slow or unreachable
+host cannot freeze Emacs; their entries merge in and redraw as they
+arrive.  Uncached entries are parsed in subprocess workers when the
+`async' library is installed and `vegeta-async-workers' > 0; otherwise
+they fall through to the in-process idle-timer parser."
   (interactive)
   (unless vegeta--cache-loaded
     (vegeta--cache-load))
   (setq vegeta--entries-cache nil)
   (clrhash vegeta--parse-queued-ids)
   (setq vegeta--parse-queue nil)
-  (let ((entries (vegeta--all-entries)))
-    (vegeta--queue-uncached entries)
-    (vegeta--redraw)
-    (cond
-     ((and vegeta--parse-queue (vegeta--async-available-p))
-      (vegeta--start-async-parse))
-     (vegeta--parse-queue
-      (vegeta--start-parse-timer)))))
+  (let ((local (vegeta--local-host-entries)))
+    (setq vegeta--entries-cache local)
+    (vegeta--queue-uncached local)
+    (vegeta--redraw))
+  (if (vegeta--async-available-p)
+      (vegeta--start-host-jobs)
+    (progn (vegeta--start-host-jobs-sync)
+           (vegeta--redraw)))
+  (vegeta--maybe-start-parse))
 
 ;;; Sidebar window commands
 
