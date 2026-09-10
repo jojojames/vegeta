@@ -134,7 +134,7 @@ An empty list produces a flat listing sorted by date."
                          (const date))))
 
 (defcustom vegeta-enabled-providers
-  '(agent-shell claude-cli antigravity-cli antigravity)
+  '(agent-shell claude-cli codex-cli antigravity-cli antigravity)
   "Provider ids to include in the sidebar.
 See `vegeta-providers' for available providers."
   :type '(repeat symbol))
@@ -580,6 +580,7 @@ Returns fewer chunks when LST has fewer elements than N."
 (defcustom vegeta-async-provider-modules
   '(vegeta-agent-shell
     vegeta-claude-cli
+    vegeta-codex-cli
     vegeta-antigravity-cli
     vegeta-antigravity)
   "Provider feature symbols each async worker `require's before parsing.

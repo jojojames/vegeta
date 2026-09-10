@@ -16,6 +16,8 @@
 ;;     id is present, else start a fresh shell in the recorded cwd.
 ;;   - Claude CLI entries: spawn `claude --resume <uuid>' in a terminal
 ;;     (ghostel/vterm/term) at the recorded cwd.
+;;   - Codex CLI entries: spawn `codex resume <uuid>' in a terminal at
+;;     the recorded cwd, preserving the session's CODEX_HOME.
 ;;
 ;; Metadata parsing (agent name, first user prompt, model) runs lazily on
 ;; an idle-timer in chunks so hundreds of transcripts don't block on
@@ -26,6 +28,7 @@
 ;;   - `vegeta-core'        — sidebar, mode, grouping, rendering, registry
 ;;   - `vegeta-agent-shell' — agent-shell provider (markdown transcripts)
 ;;   - `vegeta-claude-cli'  — Claude CLI provider (JSONL sessions)
+;;   - `vegeta-codex-cli'   — Codex CLI provider (JSONL rollouts)
 ;;
 ;; Providers self-register on load via `vegeta-register-provider'.
 
@@ -34,6 +37,7 @@
 (require 'vegeta-core)
 (require 'vegeta-agent-shell)
 (require 'vegeta-claude-cli)
+(require 'vegeta-codex-cli)
 (require 'vegeta-antigravity-cli)
 (require 'vegeta-antigravity)
 
