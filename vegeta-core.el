@@ -40,7 +40,7 @@
   "Sidebar browser for AI agent chat transcripts across providers."
   :group 'tools)
 
-(defcustom vegeta-name "*:AgentChats:*"
+(defcustom vegeta-name "*:Agent Chats:*"
   "Name of the sidebar buffer."
   :type 'string)
 
