@@ -134,7 +134,7 @@ An empty list produces a flat listing sorted by date."
                          (const date))))
 
 (defcustom vegeta-enabled-providers
-  '(agent-shell claude-cli antigravity-cli antigravity)
+  '(agent-shell claude-cli antigravity-cli antigravity eca)
   "Provider ids to include in the sidebar.
 See `vegeta-providers' for available providers."
   :type '(repeat symbol))
@@ -396,6 +396,9 @@ Accepts both agent-shell's local-time format and Claude's ISO UTC form."
 ;;   :visit        (ENTRY) -> side-effect (opens/resumes)              (required)
 ;;   :date-key     (ENTRY) -> "YYYY-MM-DD" for date grouping           (optional)
 ;;   :delete       (ENTRY) -> removes the entry's underlying storage   (optional)
+;;   :open-transcript (ENTRY) -> buffer of a rendered transcript       (optional)
+;;                 used by `vegeta-open-transcript' before falling
+;;                 back to opening the entry's `:id' file
 ;;   :skip-levels  list of level symbols to omit from grouping for
 ;;                 this provider's entries (e.g. `(model)' for a
 ;;                 single-agent provider like `claude-cli')            (optional)
@@ -604,7 +607,8 @@ Returns fewer chunks when LST has fewer elements than N."
   '(vegeta-agent-shell
     vegeta-claude-cli
     vegeta-antigravity-cli
-    vegeta-antigravity)
+    vegeta-antigravity
+    vegeta-eca)
   "Provider feature symbols each async worker `require's before parsing.
 Every built-in provider file must be listed here so its `:parse'
 implementation is registered in the worker; if it isn't, entries from
@@ -1255,11 +1259,18 @@ the raw transcript file is opened instead."
       (vegeta-visit))))
 
 (defun vegeta-open-transcript ()
-  "Open the source file for the entry at point (read-only view)."
+  "Open the source for the entry at point (read-only view).
+Providers may supply an `:open-transcript' function (ENTRY -> buffer) to
+render a friendlier transcript; when absent, the entry's `:id' file is
+opened directly."
   (interactive)
   (let ((entry (get-text-property (point) 'vegeta-entry)))
     (unless entry (user-error "No entry at point"))
-    (vegeta--pop-to (find-file-noselect (plist-get entry :id)))))
+    (let* ((provider (vegeta--entry-provider entry))
+           (opener (and provider (plist-get provider :open-transcript))))
+      (vegeta--pop-to (if opener
+                          (funcall opener entry)
+                        (find-file-noselect (plist-get entry :id)))))))
 
 (defun vegeta-toggle-group ()
   "Fold or unfold the group at point."

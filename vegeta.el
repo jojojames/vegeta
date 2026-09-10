@@ -36,6 +36,7 @@
 (require 'vegeta-claude-cli)
 (require 'vegeta-antigravity-cli)
 (require 'vegeta-antigravity)
+(require 'vegeta-eca)
 
 (provide 'vegeta)
 ;;; vegeta.el ends here
