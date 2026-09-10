@@ -802,14 +802,15 @@ groups as background parsing completes."
     (funcall (or fn #'vegeta--default-date-key) entry)))
 
 (defun vegeta--entry-repo (entry)
-  "Return ENTRY's project root, falling back to its cached working directory.
-The fallback accepts an absolute directory and adds a trailing slash.
+  "Return ENTRY's project root, or Codex's cached working directory.
+The Codex fallback accepts an absolute directory and adds a trailing slash.
 This does not parse metadata or inspect the filesystem."
   (or (plist-get entry :repo)
-      (let ((cwd (plist-get (vegeta--cached-meta entry) :cwd)))
-        (and (stringp cwd)
-             (file-name-absolute-p cwd)
-             (file-name-as-directory cwd)))))
+      (and (eq (plist-get entry :provider) 'codex-cli)
+           (let ((cwd (plist-get (vegeta--cached-meta entry) :cwd)))
+             (and (stringp cwd)
+                  (file-name-absolute-p cwd)
+                  (file-name-as-directory cwd))))))
 
 (defun vegeta--group-key (entry level)
   "Return the group key for ENTRY at LEVEL (a symbol)."
