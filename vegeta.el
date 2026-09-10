@@ -34,6 +34,7 @@
 (require 'vegeta-core)
 (require 'vegeta-agent-shell)
 (require 'vegeta-claude-cli)
+(require 'vegeta-antigravity-cli)
 
 (provide 'vegeta)
 ;;; vegeta.el ends here

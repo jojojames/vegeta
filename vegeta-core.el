@@ -130,7 +130,7 @@ An empty list produces a flat listing sorted by date."
                          (const model)
                          (const date))))
 
-(defcustom vegeta-enabled-providers '(agent-shell claude-cli)
+(defcustom vegeta-enabled-providers '(agent-shell claude-cli antigravity-cli)
   "Provider ids to include in the sidebar.
 See `vegeta-providers' for available providers."
   :type '(repeat symbol))
