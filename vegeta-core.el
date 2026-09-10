@@ -134,7 +134,7 @@ An empty list produces a flat listing sorted by date."
                          (const date))))
 
 (defcustom vegeta-enabled-providers
-  '(agent-shell claude-cli antigravity-cli antigravity)
+  '(agent-shell claude-cli codex-cli antigravity-cli antigravity)
   "Provider ids to include in the sidebar.
 See `vegeta-providers' for available providers."
   :type '(repeat symbol))
@@ -580,6 +580,7 @@ Returns fewer chunks when LST has fewer elements than N."
 (defcustom vegeta-async-provider-modules
   '(vegeta-agent-shell
     vegeta-claude-cli
+    vegeta-codex-cli
     vegeta-antigravity-cli
     vegeta-antigravity)
   "Provider feature symbols each async worker `require's before parsing.
@@ -800,11 +801,22 @@ groups as background parsing completes."
          (fn (and provider (plist-get provider :date-key))))
     (funcall (or fn #'vegeta--default-date-key) entry)))
 
+(defun vegeta--entry-repo (entry)
+  "Return ENTRY's project root, or Codex's cached working directory.
+The Codex fallback accepts an absolute directory and adds a trailing slash.
+This does not parse metadata or inspect the filesystem."
+  (or (plist-get entry :repo)
+      (and (eq (plist-get entry :provider) 'codex-cli)
+           (let ((cwd (plist-get (vegeta--cached-meta entry) :cwd)))
+             (and (stringp cwd)
+                  (file-name-absolute-p cwd)
+                  (file-name-as-directory cwd))))))
+
 (defun vegeta--group-key (entry level)
   "Return the group key for ENTRY at LEVEL (a symbol)."
   (pcase level
     ('package (plist-get entry :provider))
-    ('repo    (or (plist-get entry :repo) "(no repo)"))
+    ('repo    (or (vegeta--entry-repo entry) "(no repo)"))
     ('model   (or (vegeta--entry-agent entry) "?"))
     ('date    (vegeta--entry-date-key entry))
     (_ nil)))
@@ -892,7 +904,7 @@ Node shape: (:level LEVEL :key KEY :breadcrumb (KEYS...)
     ('repo
      (let* ((roots (delete-dups
                     (delq nil
-                          (mapcar (lambda (e) (plist-get e :repo)) entries))))
+                          (mapcar #'vegeta--entry-repo entries))))
             (all-roots (or roots (list key)))
             (names (vegeta--disambiguated-names all-roots)))
        (or (gethash key names)
