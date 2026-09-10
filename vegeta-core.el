@@ -557,30 +557,44 @@ Returns fewer chunks when LST has fewer elements than N."
         (when (derived-mode-p 'vegeta-mode)
           (vegeta--redraw))))))
 
+(defcustom vegeta-async-provider-modules
+  '(vegeta-agent-shell
+    vegeta-claude-cli
+    vegeta-antigravity-cli
+    vegeta-antigravity)
+  "Provider feature symbols each async worker `require's before parsing.
+Every built-in provider file must be listed here so its `:parse'
+implementation is registered in the worker; if it isn't, entries from
+that provider skip parsing silently and render forever as placeholders.
+Add third-party provider modules here to get the same async treatment."
+  :type '(repeat symbol)
+  :group 'vegeta)
+
 (defun vegeta--async-worker-form (batch lib-dir)
   "Return the lambda form the async worker should evaluate.
 BATCH is the entry list to parse; LIB-DIR is the directory containing
 `vegeta-core.el' so the worker can add it to its load-path."
-  `(lambda ()
-     ;; The worker inherits none of the parent's state.  Load just
-     ;; enough of vegeta to register providers and reach the parsers;
-     ;; we deliberately avoid `package-initialize' since parsing needs
-     ;; no ELPA packages (agent-shell is lazy-required by :visit).
-     (setq load-path (cons ,lib-dir load-path))
-     (require 'vegeta-core)
-     (require 'vegeta-claude-cli)
-     (require 'vegeta-agent-shell)
-     (mapcar
-      (lambda (entry)
-        (let* ((prov (alist-get (plist-get entry :provider)
-                                vegeta-providers))
-               (parser (plist-get prov :parse)))
-          ;; Return a compact tuple; the caller writes it into
-          ;; `vegeta--parse-cache' with the current schema version.
-          (list (plist-get entry :id)
-                (plist-get entry :mtime)
-                (and parser (funcall parser entry)))))
-      ',batch)))
+  (let ((modules vegeta-async-provider-modules))
+    `(lambda ()
+       ;; The worker inherits none of the parent's state.  Load just
+       ;; enough of vegeta to register providers and reach the parsers;
+       ;; we deliberately avoid `package-initialize' since parsing needs
+       ;; no ELPA packages (agent-shell is lazy-required by :visit).
+       (setq load-path (cons ,lib-dir load-path))
+       (require 'vegeta-core)
+       (dolist (m ',modules)
+         (require m))
+       (mapcar
+        (lambda (entry)
+          (let* ((prov (alist-get (plist-get entry :provider)
+                                  vegeta-providers))
+                 (parser (plist-get prov :parse)))
+            ;; Return a compact tuple; the caller writes it into
+            ;; `vegeta--parse-cache' with the current schema version.
+            (list (plist-get entry :id)
+                  (plist-get entry :mtime)
+                  (and parser (funcall parser entry)))))
+        ',batch))))
 
 (defun vegeta--async-callback (results)
   "Merge RESULTS from an async worker into the cache, then redraw."
