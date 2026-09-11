@@ -229,6 +229,130 @@ Removes:
 
 ;;; Registration
 
+;;; Search
+
+(defcustom vegeta-antigravity-cli-search-python (executable-find "python3")
+  "Path to `python3' used by the Antigravity CLI search helper.
+Only this value's basename is used on a remote host."
+  :type '(choice (file :tag "python3 executable") (string :tag "Command") (const nil))
+  :group 'vegeta)
+
+(defconst vegeta--agy-search-py
+  "import sys, os, glob, json
+
+try:
+    sys.stdout.reconfigure(line_buffering=True)
+except Exception:
+    pass
+
+scope = sys.argv[1] if len(sys.argv) > 1 else 'content'
+targets = sys.argv[2:]
+
+want = {
+    'user': ('user',),
+    'agent': ('agent',),
+    'content': ('user', 'agent'),
+    'thoughts': ('user', 'agent'),
+    'all': ('user', 'agent', 'other'),
+}.get(scope, ('user', 'agent'))
+
+def kind_of(src):
+    if not isinstance(src, str):
+        return 'other'
+    if src.startswith('USER'):
+        return 'user'
+    if src == 'MODEL':
+        return 'agent'
+    return 'other'
+
+def clean(c):
+    if not isinstance(c, str):
+        return []
+    a = c.find('<USER_REQUEST>')
+    b = c.find('</USER_REQUEST>')
+    if a != -1 and b != -1 and b > a:
+        c = c[a + 14:b]
+    else:
+        for tag in ('<ADDITIONAL_METADATA>', '<USER_SETTINGS_CHANGE>'):
+            i = c.find(tag)
+            if i != -1:
+                c = c[:i]
+    return c.splitlines()
+
+def files_for(t):
+    if os.path.isfile(t):
+        return [t]
+    if not os.path.isdir(t):
+        return []
+    out = []
+    for base, dirs, names in os.walk(t):
+        if 'chunks' in base.split(os.sep):
+            continue
+        for n in names:
+            if n.endswith('.jsonl') and n != 'transcript_full.jsonl':
+                out.append(os.path.join(base, n))
+    return out
+
+for t in targets:
+    for path in sorted(files_for(t)):
+        try:
+            fh = open(path, 'r', errors='ignore')
+        except OSError:
+            continue
+        try:
+            for i, line in enumerate(fh, 1):
+                line = line.rstrip()
+                if not line:
+                    continue
+                try:
+                    obj = json.loads(line)
+                except Exception:
+                    continue
+                k = kind_of(obj.get('source'))
+                if k not in want:
+                    continue
+                for ln in clean(obj.get('content')):
+                    ln = ln.rstrip()
+                    if ln.strip() and any(ch.isalnum() for ch in ln):
+                        print('%s:%d:%s' % (path, i, ln))
+        finally:
+            fh.close()
+"
+  "Python helper that streams searchable Antigravity CLI transcript lines.
+Each line of `transcript.jsonl' carries a `source' (USER_* or MODEL) and
+a `content' string; the helper unwraps `<USER_REQUEST>' payloads, drops
+metadata blocks, and prints FILE:LINE:TEXT.  SCOPE is argv[1]; the rest
+are TARGETS (the brain dir, or specific `.jsonl' files).  Inlined by
+`vegeta--agy-search-command' so it runs locally and over ssh remotely.")
+
+(defun vegeta--agy-search-python-for (host)
+  "Return the python3 command to use when searching HOST."
+  (let ((python (or vegeta-antigravity-cli-search-python "python3")))
+    (if (vegeta--local-host-p host)
+        python
+      (file-name-nondirectory python))))
+
+(defun vegeta--agy--search-roots (host)
+  "Return native (HOST-side) roots to search for Antigravity CLI chats."
+  (if (vegeta--local-host-p host)
+      (list vegeta-antigravity-cli-brain-dir)
+    (list (vegeta--host-join host "~/.gemini/antigravity-cli/brain/"))))
+
+(defun vegeta--agy-search-command (host scope targets)
+  "Return a shell command that streams Antigravity CLI matches on HOST.
+TARGETS, when non-nil, restricts the search to those native paths (the
+marked conversations or transcript files); nil falls back to the brain
+dir.  SCOPE selects user/agent content.  The Python helper is inlined so
+it runs locally and, ssh-wrapped by `fzfa-tramp', on a remote host."
+  (let ((paths (or targets (vegeta--agy--search-roots host)))
+        (python (vegeta--agy-search-python-for host)))
+    (when (and python paths)
+      (format "%s -c %s %s%s"
+              (shell-quote-argument python)
+              (shell-quote-argument vegeta--agy-search-py)
+              (shell-quote-argument (format "%s" (or scope 'content)))
+              (concat " " (mapconcat #'shell-quote-argument paths " "))))))
+
 (vegeta-register-provider
  (list :id 'antigravity-cli
        :name "Antigravity CLI"
@@ -243,6 +367,7 @@ Removes:
                      . "~/.gemini/antigravity-cli/brain/")
                     (vegeta-antigravity-cli-conversations-dir
                      . "~/.gemini/antigravity-cli/conversations/"))
+       :search-command #'vegeta--agy-search-command
        ;; Every agy entry is Gemini; skip the redundant model level.
        :skip-levels '(model)))
 
