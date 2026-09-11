@@ -166,13 +166,22 @@ user can see the chat has continued past its opening prompt.  Set to
 nil to always hide the suffix."
   :type '(choice (const :tag "Disabled" nil) integer))
 
-(defcustom vegeta-max-line-width 80
+(defcustom vegeta-max-line-width 'window
   "Maximum characters per rendered chat row.
 Entry titles are truncated with an ellipsis so the whole row (indent +
 mark + date + optional update suffix + title) fits in this many
-columns.  Set to nil to disable truncation and rely on
-`truncate-lines' for horizontal clipping."
-  :type '(choice (const :tag "Unlimited (rely on truncate-lines)" nil)
+columns.
+
+Values:
+  `window'  — use the width of the window currently displaying the
+              buffer.  Full-frame views get full width; a narrow
+              sidebar clips titles to the sidebar's width.  Resizing
+              the window triggers a redraw so titles re-fit.
+  integer   — fixed width regardless of the window.
+  nil       — no textual truncation; rely on `truncate-lines' for
+              horizontal clipping."
+  :type '(choice (const :tag "Window width (adaptive)" window)
+                 (const :tag "Unlimited (rely on truncate-lines)" nil)
                  integer))
 
 ;;; Faces
@@ -251,6 +260,11 @@ When it hits zero after a refresh, the persisted cache flushes to disk.")
 
 (defvar-local vegeta--collapsed nil
   "Hash table of collapsed group breadcrumbs (list of level keys).")
+
+(defvar-local vegeta--rendered-width nil
+  "Effective row width used by the last redraw, or nil when untruncated.
+Lets `vegeta--window-size-changed' skip a redraw when a size-change
+event finds the displaying window at the width already rendered.")
 
 (defvar-local vegeta--refresh-timer-object nil
   "Per-buffer idle timer for auto-refresh.")
@@ -939,19 +953,44 @@ ENTRIES-AT-NODE is the flat list of entries below this node."
        vegeta-collapsed ,collapsed))
     (insert "\n")))
 
+(defun vegeta--window-for-buffer ()
+  "Return a window displaying the current buffer, or nil.
+Prefers the selected window so truncation follows the window the user
+is actually looking at when the buffer is shown in more than one."
+  (or (and (eq (window-buffer (selected-window)) (current-buffer))
+           (selected-window))
+      (get-buffer-window (current-buffer) t)
+      (car (get-buffer-window-list (current-buffer) nil t))))
+
+(defun vegeta--max-line-width ()
+  "Resolve `vegeta-max-line-width' to a column count, or nil for no limit.
+An integer is used as-is.  The symbol `window' yields the body width of
+a window displaying the current buffer, preferring the selected window
+and falling back to the selected window's width when the buffer isn't
+displayed yet (e.g. while it is being created and first refreshed).
+Returns nil to disable truncation."
+  (cond
+   ((integerp vegeta-max-line-width) vegeta-max-line-width)
+   ((eq vegeta-max-line-width 'window)
+    (window-body-width (or (vegeta--window-for-buffer)
+                           (selected-window))))
+   (t nil)))
+
 (defun vegeta--truncate-title (title prefix-width)
-  "Truncate TITLE so PREFIX-WIDTH + its length fits `vegeta-max-line-width'.
-Returns TITLE unchanged when the limit is disabled or the title already
-fits.  Uses `truncate-string-to-width' with an ellipsis so multi-byte
-characters are counted correctly."
-  (if (or (null title)
-          (null vegeta-max-line-width)
-          (<= (+ prefix-width (string-width title))
-              vegeta-max-line-width))
-      title
-    (truncate-string-to-width
-     title (max 1 (- vegeta-max-line-width prefix-width))
-     nil nil "…")))
+  "Truncate TITLE so PREFIX-WIDTH + its length fits the row width.
+The row width comes from `vegeta--max-line-width', which resolves
+`vegeta-max-line-width' (a fixed integer, the displaying window's body
+width, or nil for no limit).  Returns TITLE unchanged when the limit is
+disabled or the title already fits.  Uses `truncate-string-to-width'
+with an ellipsis so multi-byte characters are counted correctly."
+  (let ((max-width (vegeta--max-line-width)))
+    (if (or (null title)
+            (null max-width)
+            (<= (+ prefix-width (string-width title)) max-width))
+        title
+      (truncate-string-to-width
+       title (max 1 (- max-width prefix-width))
+       nil nil "…"))))
 
 (defun vegeta--render-entry-row (entry depth mark)
   "Insert one chat row for ENTRY at DEPTH with optional MARK."
@@ -1042,6 +1081,7 @@ characters are counted correctly."
 (defun vegeta--redraw ()
   "Redraw the current sidebar buffer, preserving point when possible."
   (when (derived-mode-p 'vegeta-mode)
+    (setq vegeta--rendered-width (vegeta--max-line-width))
     (let* ((prev-entry-id
             (let ((e (get-text-property (point) 'vegeta-entry)))
               (and e (plist-get e :id))))
@@ -1095,6 +1135,20 @@ characters are counted correctly."
             (unless found (forward-line 1)))
           (unless found (goto-char (point-min)))))
        (t (forward-line (1- prev-line)))))))
+
+(defun vegeta--window-size-changed (&optional frame)
+  "Redraw vegeta buffers in FRAME whose displaying window width changed.
+Registered on `window-size-change-functions' so resizing the sidebar or
+the full-frame view re-fits titles to the new width.  Buffers already
+rendered at the new width are left untouched."
+  (dolist (win (window-list frame 'no-minibuffer))
+    (with-current-buffer (window-buffer win)
+      (when (and (derived-mode-p 'vegeta-mode)
+                 (not (equal (window-body-width win)
+                             vegeta--rendered-width)))
+        (vegeta--redraw)))))
+
+(add-hook 'window-size-change-functions #'vegeta--window-size-changed)
 
 ;;; Sidebar mode + keymap
 
