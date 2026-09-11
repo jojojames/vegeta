@@ -305,6 +305,93 @@ so this is best-effort local cleanup."
 
 ;;; Registration
 
+;;; Search
+
+(defcustom vegeta-antigravity-search-python (executable-find "python3")
+  "Path to `python3' used by the Antigravity search helper.
+Only this value's basename is used on a remote host."
+  :type '(choice (file :tag "python3 executable") (string :tag "Command") (const nil))
+  :group 'vegeta)
+
+(defconst vegeta--antigravity-search-py
+  "import sys, os
+
+try:
+    sys.stdout.reconfigure(line_buffering=True)
+except Exception:
+    pass
+
+scope = sys.argv[1] if len(sys.argv) > 1 else 'content'
+targets = sys.argv[2:]
+
+TEXT_EXT = ('.md', '.txt')
+
+def files_for(t):
+    if os.path.isfile(t):
+        return [t]
+    if not os.path.isdir(t):
+        return []
+    out = []
+    for base, dirs, names in os.walk(t):
+        parts = base.split(os.sep)
+        if '.system_generated' in parts or 'chunks' in parts:
+            continue
+        for n in names:
+            if n.endswith(TEXT_EXT):
+                out.append(os.path.join(base, n))
+    return out
+
+for t in targets:
+    for path in sorted(files_for(t)):
+        try:
+            fh = open(path, 'r', errors='ignore')
+        except OSError:
+            continue
+        try:
+            for i, line in enumerate(fh, 1):
+                s = line.rstrip()
+                if s.strip() and any(ch.isalnum() for ch in s):
+                    print('%s:%d:%s' % (path, i, s))
+        finally:
+            fh.close()
+"
+  "Python helper that streams searchable Antigravity IDE artifact lines.
+The IDE encrypts conversations, but each brain directory keeps plaintext
+plan/step artifacts (`*.md', `*.txt'); this prints their lines as
+FILE:LINE:TEXT.  The conversation is not threaded here, so SCOPE is
+ignored (argv[1] is accepted for interface parity).  Inlined by
+`vegeta--antigravity-search-command' so it runs locally and over ssh
+on a remote host.")
+
+(defun vegeta--antigravity-search-python-for (host)
+  "Return the python3 command to use when searching HOST."
+  (let ((python (or vegeta-antigravity-search-python "python3")))
+    (if (vegeta--local-host-p host)
+        python
+      (file-name-nondirectory python))))
+
+(defun vegeta--antigravity--search-roots (host)
+  "Return native (HOST-side) roots to search for Antigravity artifacts."
+  (if (vegeta--local-host-p host)
+      (list vegeta-antigravity-data-dir)
+    (list (vegeta--host-join host "~/.gemini/antigravity/"))))
+
+(defun vegeta--antigravity-search-command (host scope targets)
+  "Return a shell command that streams Antigravity matches on HOST.
+TARGETS, when non-nil, restricts the search to those native paths (the
+marked conversation brain dirs); nil falls back to the data dir.  SCOPE
+is accepted for interface parity but Antigravity artifacts are not
+thread-structured, so it is ignored.  The Python helper is inlined so it
+runs locally and, ssh-wrapped by `fzfa-tramp', on a remote host."
+  (let ((paths (or targets (vegeta--antigravity--search-roots host)))
+        (python (vegeta--antigravity-search-python-for host)))
+    (when (and python paths)
+      (format "%s -c %s %s%s"
+              (shell-quote-argument python)
+              (shell-quote-argument vegeta--antigravity-search-py)
+              (shell-quote-argument (format "%s" (or scope 'content)))
+              (concat " " (mapconcat #'shell-quote-argument paths " "))))))
+
 (vegeta-register-provider
  (list :id 'antigravity
        :name "Antigravity"
@@ -316,6 +403,7 @@ so this is best-effort local cleanup."
        ;; `:visit' launches the local Antigravity IDE (there is no remote
        ;; deep-link), so the provider is local-only.
        :local-only t
+       :search-command #'vegeta--antigravity-search-command
        ;; Every IDE conversation is Gemini; skip the redundant model level.
        :skip-levels '(model)))
 
