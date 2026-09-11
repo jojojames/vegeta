@@ -299,6 +299,126 @@ so the date is available deterministically without parsing the file."
         (match-string 1 name)
       (vegeta--default-date-key entry))))
 
+;;; Search
+
+(defcustom vegeta-agent-shell-search-python (executable-find "python3")
+  "Path to `python3' used by the agent-shell search helper.
+The helper is sent inline as a `python3 -c' program, so `python3' must
+exist on whichever host is searched (locally, or on a remote host's
+PATH).  On a remote host only this value's basename is used, so the
+host's own PATH resolves the interpreter; set it to a bare `\"python3\"'
+if the remote names it differently."
+  :type '(choice (file :tag "python3 executable") (string :tag "Command") (const nil))
+  :group 'vegeta)
+
+(defconst vegeta--agent-shell-search-py
+  "import sys, os, glob
+
+try:
+    sys.stdout.reconfigure(line_buffering=True)
+except Exception:
+    pass
+
+scope = sys.argv[1] if len(sys.argv) > 1 else 'content'
+roots = sys.argv[2:]
+
+want = {
+    'user': ('user',),
+    'agent': ('agent',),
+    'content': ('user', 'agent'),
+    'thoughts': ('user', 'agent', 'thoughts'),
+    'all': ('user', 'agent', 'thoughts', 'other'),
+}.get(scope, ('user', 'agent'))
+
+def classify(s):
+    if s.startswith('### '):
+        return 'tool'
+    if s.startswith('**Tool:**'):
+        return 'tool'
+    if s.startswith(\"## Agent's Thoughts\"):
+        return 'thoughts'
+    if s.startswith('## User '):
+        return 'user'
+    if s.startswith('## Agent '):
+        return 'agent'
+    if s.startswith('## '):
+        return 'other'
+    return None
+
+def scan(path):
+    kind = 'other'
+    try:
+        fh = open(path, 'r', errors='ignore')
+    except OSError:
+        return
+    try:
+        for i, line in enumerate(fh, 1):
+            s = line.rstrip()
+            c = classify(s)
+            if c is not None:
+                kind = c
+                continue
+            if kind == 'tool':
+                continue
+            if not s.strip():
+                continue
+            if s.strip() in ('---', '```', '~~~'):
+                continue
+            if kind in want:
+                print('%s:%d:%s' % (path, i, s))
+    finally:
+        fh.close()
+
+for root in roots:
+    base = os.path.join(root, '.agent-shell', 'transcripts')
+    for path in sorted(glob.glob(os.path.join(base, '*.md'))):
+        scan(path)
+"
+  "Python helper that streams searchable agent-shell transcript lines.
+It is structural: it tracks the current `## User' / `## Agent' /
+`## Agent's Thoughts' section and any `### Tool Call' (or `**Tool:**')
+block, then emits only the requested kinds.  SCOPE comes from argv[1]
+\(user / agent / content = user+agent / thoughts / all), roots follow
+as argv[2:].  Tool-call bodies, file paths, command output and compile
+logs are therefore excluded for the default `content' scope.  Inlined
+by `vegeta--agent-shell-search-command' so it runs unchanged locally
+and, wrapped by `fzfa-tramp', over ssh on a remote host.")
+
+(defun vegeta--agent-shell--search-roots (host)
+  "Return native (HOST-side) project roots to search for agent-shell."
+  (let ((vegeta--current-host host))
+    (delq nil
+          (mapcar (lambda (r) (vegeta--unhostify host r))
+                  (vegeta--project-roots)))))
+
+(defun vegeta--agent-shell-search-python-for (host)
+  "Return the python3 command to use when searching HOST.
+On the local host the resolved `vegeta-agent-shell-search-python' is
+used.  On a remote host that local absolute path is meaningless, so
+only its basename is used and the host's PATH resolves it."
+  (let ((python (or vegeta-agent-shell-search-python "python3")))
+    (if (vegeta--local-host-p host)
+        python
+      (file-name-nondirectory python))))
+
+(defun vegeta--agent-shell-search-command (host scope)
+  "Return a shell command that streams agent-shell matches on HOST.
+SCOPE selects which transcript sections are emitted (`user', `agent',
+`content', `thoughts' or `all').  The Python helper is inlined via
+`python3 -c' (not a temp file) so it works locally and, ssh-wrapped by
+`fzfa-tramp', on a remote host; roots are native host paths and the
+interpreter is named so the host's PATH resolves it."
+  (let ((roots (vegeta--agent-shell--search-roots host))
+        (python (vegeta--agent-shell-search-python-for host)))
+    (when python
+      (format "%s -c %s %s%s"
+              (shell-quote-argument python)
+              (shell-quote-argument vegeta--agent-shell-search-py)
+              (shell-quote-argument (format "%s" (or scope 'content)))
+              (if roots
+                  (concat " " (mapconcat #'shell-quote-argument roots " "))
+                "")))))
+
 ;;; Registration
 
 (vegeta-register-provider
@@ -318,7 +438,10 @@ so the date is available deterministically without parsing the file."
        ;; cross-references Claude CLI JSONLs to recover a resumable
        ;; session id for orphaned transcripts — on a remote host that
        ;; must read the *remote* Claude dir.
-       :host-dirs '((vegeta-claude-cli-projects-dir . "~/.claude/projects/"))))
+       :host-dirs '((vegeta-claude-cli-projects-dir . "~/.claude/projects/"))
+       ;; Owns its own full-text search script, sent to the host (local
+       ;; or, via `fzfa-tramp', remote).  See `vegeta-search'.
+       :search-command #'vegeta--agent-shell-search-command))
 
 (provide 'vegeta-agent-shell)
 ;;; vegeta-agent-shell.el ends here

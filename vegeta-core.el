@@ -24,6 +24,7 @@
 
 (declare-function agent-shell-buffers "agent-shell")
 (declare-function agent-shell-cwd "agent-shell")
+(declare-function fzfa-completing-read "fzfa" (&rest args))
 
 (declare-function evil-define-key* "evil-core")
 (declare-function evil-make-overriding-map "evil-core")
@@ -611,6 +612,10 @@ interactive CLIs work), starting in DIRECTORY."
 ;;   :open-transcript (ENTRY) -> buffer of a rendered transcript       (optional)
 ;;                 used by `vegeta-open-transcript' before falling
 ;;                 back to opening the entry's `:id' file
+;;   :search-command (HOST SCOPE) -> shell command string              (optional)
+;;                 full-text search; the string is streamed by `fzfa'
+;;                 (spawned locally for localhost, ssh-wrapped for a
+;;                 remote host).  SCOPE is one of `vegeta-search-scope'
 ;;   :host-dirs    alist of (VARIABLE . "~/relative/path")            (optional)
 ;;                 data roots; rebound to `/ssh:HOST:...' so the
 ;;                 provider can run against a remote `vegeta-hosts'
@@ -1559,6 +1564,7 @@ rendered at the new width are left untouched."
     (define-key map (kbd "RET") #'vegeta-visit)
     (define-key map (kbd "o") #'vegeta-open-transcript)
     (define-key map (kbd "g") #'vegeta-refresh)
+    (define-key map (kbd "s") #'vegeta-search)
     (define-key map (kbd "q") #'vegeta-hide-sidebar)
     (define-key map (kbd "n") #'vegeta-next-line)
     (define-key map (kbd "p") #'vegeta-previous-line)
@@ -1809,6 +1815,87 @@ they fall through to the in-process idle-timer parser."
            (vegeta--redraw)))
   (vegeta--maybe-start-parse))
 
+;;; Commands: search
+
+(defcustom vegeta-search-scope 'content
+  "Default sections searched by `vegeta-search'.
+One of:
+  `content'  — user and agent prose (default; skips tool-call noise)
+  `user'     — user messages only
+  `agent'    — agent replies only
+  `thoughts' — the above plus the agent's reasoning
+  `all'      — raw, including tool calls and their output
+Providers translate this to their own storage."
+  :type '(choice (const content) (const user) (const agent)
+                 (const thoughts) (const all))
+  :group 'vegeta)
+
+(defun vegeta--read-scope ()
+  "Prompt for a `vegeta-search' scope and return it as a symbol."
+  (intern (completing-read "Search scope: "
+                           '("content" "user" "agent" "thoughts" "all")
+                           nil t nil nil "content")))
+
+(defun vegeta--read-host ()
+  "Prompt for one of `vegeta-hosts'; default to the first."
+  (let ((hosts (mapcar #'car (vegeta--hosts))))
+    (completing-read "Host: " hosts nil t nil nil (car hosts))))
+
+(defun vegeta--search-visit (host cand)
+  "Open CAND (a FILE:LINE:TEXT match from HOST) at its line.
+FILE is host-native, so it is tramp-qualified for a remote HOST before
+being opened."
+  (if (string-match "\\`\\(.+?\\):\\([0-9]+\\):" cand)
+      (let ((file (vegeta--hostify host (match-string 1 cand)))
+            (line (string-to-number (match-string 2 cand))))
+        (with-current-buffer (find-file-noselect file)
+          (goto-char (point-min))
+          (forward-line (1- (max 1 line)))
+          (recenter)))
+    (user-error "Not a FILE:LINE match: %S" cand)))
+
+;;;###autoload
+(defun vegeta-search (&optional host scope)
+  "Fuzzy full-text search across chat transcripts.
+SCOPE (default `vegeta-search-scope') selects which sections are
+searched and is passed to each provider's `:search-command'; with a
+prefix argument, prompt for it.  Each provider that declares a
+`:search-command' supplies its own script, sent to HOST and streamed
+through `fzfa' (a locally spawned command for localhost; a remote-shell
+payload for a remote host via `fzfa-tramp').  With no HOST, prompt for
+one of `vegeta-hosts'."
+  (interactive
+   (list nil (when current-prefix-arg (vegeta--read-scope))))
+  (unless (require 'fzfa nil t)
+    (user-error "vegeta-search requires the `fzfa' package"))
+  (let* ((host (or host (vegeta--read-host)))
+         (scope (or scope vegeta-search-scope))
+         (spec (cdr (assoc host (vegeta--hosts))))
+         (providers (seq-filter (lambda (p) (plist-get p :search-command))
+                                (vegeta--providers-for-host (or spec 'all))))
+         (commands (delq nil
+                         (mapcar (lambda (p)
+                                   (funcall (plist-get p :search-command)
+                                            host scope))
+                                 providers))))
+    (when (null commands)
+      (user-error "No provider on %s supports full-text search" host))
+    (when-let* ((cand (fzfa-completing-read
+                       :prompt (format "Search %s [%s]: " host scope)
+                       :command (mapconcat #'identity commands " ; ")
+                       :directory (if (vegeta--local-host-p host)
+                                      default-directory
+                                    (concat (vegeta--host-tramp-prefix host) "/"))
+                       :category 'fzfa-grep
+                       :skip-executable-check t)))
+      (vegeta--search-visit host cand))))
+
+;;;###autoload
+(defun vegeta-search-user (&optional host)
+  "Like `vegeta-search', but only match user messages."
+  (interactive)
+  (vegeta-search host 'user))
+
 ;;; Sidebar window commands
 
 (defun vegeta--sidebar-window (&optional _frame)
@@ -1915,6 +2002,7 @@ registry, so parsing done in one is immediately visible in the other."
       (kbd "RET") #'vegeta-visit
       (kbd "o")   #'vegeta-open-transcript
       (kbd "gr")  #'vegeta-refresh
+      (kbd "s")   #'vegeta-search
       (kbd "gg")  #'evil-goto-first-line
       (kbd "G")   #'evil-goto-line
       (kbd "j")   #'vegeta-next-line
