@@ -328,6 +328,129 @@ before the full parse runs.  Falls back to mtime, then `unknown'."
 
 ;;; Registration
 
+;;; Search
+
+(defcustom vegeta-claude-cli-search-python (executable-find "python3")
+  "Path to `python3' used by the Claude CLI search helper.
+Only this value's basename is used on a remote host, so the host's PATH
+must resolve `python3'."
+  :type '(choice (file :tag "python3 executable") (string :tag "Command") (const nil))
+  :group 'vegeta)
+
+(defconst vegeta--claude-cli-search-py
+  "import sys, os, glob, json
+
+try:
+    sys.stdout.reconfigure(line_buffering=True)
+except Exception:
+    pass
+
+scope = sys.argv[1] if len(sys.argv) > 1 else 'content'
+targets = sys.argv[2:]
+
+want = {
+    'user': ('user',),
+    'agent': ('agent',),
+    'content': ('user', 'agent'),
+    'thoughts': ('user', 'agent', 'thinking'),
+    'all': ('user', 'agent', 'thinking', 'tool'),
+}.get(scope, ('user', 'agent'))
+
+def files_for(t):
+    if os.path.isdir(t):
+        return glob.glob(os.path.join(t, '**', '*.jsonl'), recursive=True)
+    if os.path.isfile(t):
+        return [t]
+    return []
+
+def blocks(content):
+    out = []
+    if isinstance(content, str):
+        out.append(('text', content))
+    elif isinstance(content, list):
+        for b in content:
+            if not isinstance(b, dict):
+                continue
+            ty = b.get('type')
+            if ty == 'text':
+                out.append(('text', b.get('text') or ''))
+            elif ty == 'thinking':
+                out.append(('thinking', b.get('thinking') or b.get('text') or ''))
+            elif ty in ('tool_use', 'tool_result'):
+                out.append(('tool', json.dumps(b)))
+    return out
+
+def scan(path):
+    try:
+        fh = open(path, 'r', errors='ignore')
+    except OSError:
+        return
+    try:
+        for i, line in enumerate(fh, 1):
+            line = line.rstrip()
+            if not line:
+                continue
+            try:
+                obj = json.loads(line)
+            except Exception:
+                continue
+            ty = obj.get('type')
+            if ty not in ('user', 'assistant') or obj.get('isMeta'):
+                continue
+            role = 'user' if ty == 'user' else 'agent'
+            msg = obj.get('message') or {}
+            for kind, text in blocks(msg.get('content')):
+                bucket = role if kind == 'text' else ('thinking' if kind == 'thinking' else 'tool')
+                if bucket not in want:
+                    continue
+                for ln in text.splitlines():
+                    ln = ln.rstrip()
+                    if ln.strip() and any(ch.isalnum() for ch in ln):
+                        print('%s:%d:%s' % (path, i, ln))
+    finally:
+        fh.close()
+
+for t in targets:
+    for path in sorted(files_for(t)):
+        scan(path)
+"
+  "Python helper that streams searchable Claude CLI transcript lines.
+Claude stores one JSON object per line; this reads the `message.content'
+text (and, for wider scopes, thinking/tool blocks), skips meta rows and
+non-message rows, and prints FILE:LINE:TEXT.  SCOPE is argv[1]; the
+remaining argv are TARGETS (a projects dir, or specific `.jsonl'
+files).  Inlined by `vegeta--claude-cli-search-command' so it runs
+unchanged locally and over ssh on a remote host.")
+
+(defun vegeta--claude-cli-search-python-for (host)
+  "Return the python3 command to use when searching HOST."
+  (let ((python (or vegeta-claude-cli-search-python "python3")))
+    (if (vegeta--local-host-p host)
+        python
+      (file-name-nondirectory python))))
+
+(defun vegeta--claude-cli--search-roots (host)
+  "Return native (HOST-side) roots to search for Claude CLI sessions."
+  (if (vegeta--local-host-p host)
+      (list vegeta-claude-cli-projects-dir)
+    (list (vegeta--host-join host "~/.claude/projects/"))))
+
+(defun vegeta--claude-cli-search-command (host scope targets)
+  "Return a shell command that streams Claude CLI matches on HOST.
+TARGETS, when non-nil, is a list of native paths to search (session
+files or the projects dir); nil falls back to the host's projects dir.
+SCOPE (`user', `agent', `content', `thoughts' or `all') selects which
+message content is searched.  The Python helper is inlined so it runs
+locally and, ssh-wrapped by `fzfa-tramp', on a remote host."
+  (let ((paths (or targets (vegeta--claude-cli--search-roots host)))
+        (python (vegeta--claude-cli-search-python-for host)))
+    (when (and python paths)
+      (format "%s -c %s %s%s"
+              (shell-quote-argument python)
+              (shell-quote-argument vegeta--claude-cli-search-py)
+              (shell-quote-argument (format "%s" (or scope 'content)))
+              (concat " " (mapconcat #'shell-quote-argument paths " "))))))
+
 (vegeta-register-provider
  (list :id 'claude-cli
        :name "Claude CLI"
@@ -340,6 +463,7 @@ before the full parse runs.  Falls back to mtime, then `unknown'."
        ;; remote host's `/ssh:HOST:~/...' when listed there.
        :host-dirs '((vegeta-claude-cli-projects-dir . "~/.claude/projects/")
                     (vegeta-claude-cli-session-env-dir . "~/.claude/session-env/"))
+       :search-command #'vegeta--claude-cli-search-command
        ;; Every claude-cli entry is Claude; the model level would just
        ;; wrap everything in a single `Claude (N)' node — noise.
        :skip-levels '(model)))
