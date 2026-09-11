@@ -384,6 +384,130 @@ since there is no offline way to keep the index consistent."
       (when (and (stringp path) (file-exists-p path))
         (ignore-errors (delete-file path))))))
 
+;;; Search
+
+(defcustom vegeta-eca-search-python (executable-find "python3")
+  "Path to `python3' used by the ECA search helper.
+The helper is inlined as a `python3 -c' program, so `python3' must exist
+on this machine."
+  :type '(choice (file :tag "python3 executable") (string :tag "Command") (const nil))
+  :group 'vegeta)
+
+(defconst vegeta--eca-search-py
+  "import sys, os, json, glob, subprocess
+
+try:
+    sys.stdout.reconfigure(line_buffering=True)
+except Exception:
+    pass
+
+eca = sys.argv[1]
+cache_root = sys.argv[2]
+scope = sys.argv[3] if len(sys.argv) > 3 else 'content'
+targets = sys.argv[4:]
+
+want = {
+    'user': ('user',),
+    'agent': ('assistant',),
+    'content': ('user', 'assistant'),
+    'thoughts': ('user', 'assistant', 'reason'),
+    'all': None,
+}.get(scope, ('user', 'assistant'))
+
+def text_of(content):
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = []
+        for b in content:
+            if isinstance(b, dict) and b.get('text'):
+                parts.append(b.get('text'))
+        return chr(10).join(parts)
+    return ''
+
+def emit(path, obj):
+    if want is not None and obj.get('role') not in want:
+        return
+    for ln in text_of(obj.get('content')).splitlines():
+        ln = ln.rstrip()
+        if ln.strip():
+            print('%s:1:%s' % (path, ln))
+
+def read_chat(cache_dir, chat_id, path):
+    try:
+        r = subprocess.run([eca, 'read-chat', '--db-cache-path', cache_dir,
+                            '--chat-id', chat_id],
+                           stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    except OSError:
+        return
+    for line in r.stdout.decode('utf-8', 'ignore').splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            obj = json.loads(line)
+        except Exception:
+            continue
+        emit(path, obj)
+
+def chat_ids(cache_dir):
+    try:
+        r = subprocess.run([eca, 'read-chat', '--db-cache-path', cache_dir],
+                           stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    except OSError:
+        return []
+    ids = []
+    for line in r.stdout.decode('utf-8', 'ignore').splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            obj = json.loads(line)
+        except Exception:
+            continue
+        cid = obj.get('id')
+        if cid:
+            ids.append(cid)
+    return ids
+
+if targets:
+    for t in targets:
+        base = os.path.basename(t)
+        if base.endswith('.transit.json'):
+            cid = base[:-len('.transit.json')]
+            read_chat(os.path.dirname(os.path.dirname(t)), cid, t)
+else:
+    for cache_dir in sorted(glob.glob(os.path.join(cache_root, '*'))):
+        if not os.path.isdir(cache_dir):
+            continue
+        for cid in chat_ids(cache_dir):
+            read_chat(cache_dir, cid,
+                      os.path.join(cache_dir, 'chats', cid + '.transit.json'))
+"
+  "Python helper that streams searchable ECA message lines.
+Runs `eca read-chat' (the local ECA binary) for each target chat — a
+marked `<uuid>.transit.json' file, or every chat under the cache root
+when no targets are given — and prints `FILE:1:TEXT' for messages whose
+role matches SCOPE.  ECA is local-only, so this never runs remotely.")
+
+(defun vegeta--eca-search-command (host scope targets)
+  "Return a shell command that streams ECA matches on HOST.
+ECA is local-only, so nil is returned for a remote HOST.  TARGETS, when
+non-nil, restricts the search to those `<uuid>.transit.json' files;
+otherwise every chat under `vegeta-eca-cache-dir' is searched."
+  (when (and (vegeta--local-host-p host)
+             vegeta-eca-server-command
+             vegeta-eca-search-python)
+    (format "%s -c %s %s %s %s%s"
+            (shell-quote-argument vegeta-eca-search-python)
+            (shell-quote-argument vegeta--eca-search-py)
+            (shell-quote-argument vegeta-eca-server-command)
+            (shell-quote-argument vegeta-eca-cache-dir)
+            (shell-quote-argument (format "%s" (or scope 'content)))
+            (if targets
+                (concat " " (mapconcat #'shell-quote-argument targets " "))
+              ""))))
+
 ;;; Registration
 
 (vegeta-register-provider
@@ -397,6 +521,7 @@ since there is no offline way to keep the index consistent."
        ;; `:list' shells out to the local `eca' binary and reads the
        ;; local cache, so the provider is local-only.
        :local-only t
+       :search-command #'vegeta--eca-search-command
        ;; Keep the model level: ECA chats span providers/models
        ;; (deepseek/..., anthropic/...), so grouping by model is useful.
        :open-transcript #'vegeta--eca-open-transcript))
