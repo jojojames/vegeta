@@ -25,6 +25,9 @@
 (declare-function agent-shell-buffers "agent-shell")
 (declare-function agent-shell-cwd "agent-shell")
 (declare-function fzfa-completing-read "fzfa" (&rest args))
+(declare-function fzfa--read "fzfa" (sources &rest args))
+(declare-function fzfa--ensure-setup "fzfa" ())
+(declare-function fzfa--multi-allocate-narrow-keys "fzfa" (sources))
 
 (declare-function evil-define-key* "evil-core")
 (declare-function evil-make-overriding-map "evil-core")
@@ -209,6 +212,12 @@ user can see the chat has continued past its opening prompt.  Set to
 nil to always hide the suffix."
   :type '(choice (const :tag "Disabled" nil) integer))
 
+(defcustom vegeta-delete-double-confirm-threshold 5
+  "Ask a second confirmation when deleting more than this many chats.
+Above the threshold, the first `yes-or-no-p' is followed by a second,
+stronger one.  Set to nil to always confirm only once."
+  :type '(choice (const :tag "Never double-confirm" nil) integer))
+
 (defcustom vegeta-max-line-width 'window
   "Maximum characters per rendered chat row.
 Entry titles are truncated with an ellipsis so the whole row (indent +
@@ -250,8 +259,12 @@ Values:
   "Face for the `(updated ...)' suffix on entry rows.")
 
 (defface vegeta-mark-face
-  '((t :inherit warning))
-  "Face for row marks (e.g. delete).")
+  '((t :inherit dired-mark))
+  "Face for the generic mark (`*', dired's `m').")
+
+(defface vegeta-flag-face
+  '((t :inherit dired-flagged))
+  "Face for the deletion flag (`D', dired's `d').")
 
 (defface vegeta-placeholder-face
   '((t :inherit shadow))
@@ -612,10 +625,13 @@ interactive CLIs work), starting in DIRECTORY."
 ;;   :open-transcript (ENTRY) -> buffer of a rendered transcript       (optional)
 ;;                 used by `vegeta-open-transcript' before falling
 ;;                 back to opening the entry's `:id' file
-;;   :search-command (HOST SCOPE) -> shell command string              (optional)
+;;   :search-command (HOST SCOPE TARGETS) -> shell command string      (optional)
 ;;                 full-text search; the string is streamed by `fzfa'
 ;;                 (spawned locally for localhost, ssh-wrapped for a
-;;                 remote host).  SCOPE is one of `vegeta-search-scope'
+;;                 remote host).  SCOPE is one of `vegeta-search-scope';
+;;                 TARGETS is nil (search the provider's default roots)
+;;                 or a list of native paths to restrict to (e.g. the
+;;                 marked chats)
 ;;   :host-dirs    alist of (VARIABLE . "~/relative/path")            (optional)
 ;;                 data roots; rebound to `/ssh:HOST:...' so the
 ;;                 provider can run against a remote `vegeta-hosts'
@@ -1417,9 +1433,7 @@ with an ellipsis so multi-byte characters are counted correctly."
                 (format-time-string " (updated %m-%d %H:%M)"
                                     (seconds-to-time updated))
                 'face 'vegeta-updated-face)))
-         (mark-str (if (eq mark 'delete)
-                       (propertize "D" 'face 'vegeta-mark-face)
-                     " "))
+         (mark-str (vegeta--mark-string mark))
          (indent (make-string (+ 2 (* 2 depth)) ?\s))
          ;; Everything except the title itself contributes to the
          ;; prefix width used by `vegeta--truncate-title'.  Include
@@ -1569,6 +1583,7 @@ rendered at the new width are left untouched."
     (define-key map (kbd "n") #'vegeta-next-line)
     (define-key map (kbd "p") #'vegeta-previous-line)
     (define-key map (kbd "d") #'vegeta-mark-delete)
+    (define-key map (kbd "m") #'vegeta-mark)
     (define-key map (kbd "u") #'vegeta-unmark)
     (define-key map (kbd "U") #'vegeta-unmark-all)
     (define-key map (kbd "x") #'vegeta-execute)
@@ -1689,26 +1704,42 @@ opened directly."
 
 ;;; Commands: marks
 
-(defun vegeta-mark-delete ()
-  "Mark the entry at point for deletion."
-  (interactive)
+(defun vegeta--mark-string (mark)
+  "Return the display string for MARK (a symbol), or a blank column.
+Dired-style: `*' for the generic mark, `D' for the deletion flag."
+  (pcase mark
+    ('delete (propertize "D" 'face 'vegeta-flag-face))
+    ('marked (propertize "*" 'face 'vegeta-mark-face))
+    (_ " ")))
+
+(defun vegeta--set-mark (mark)
+  "Set MARK (or clear it when nil) on the entry at point, then move down."
   (let ((entry (get-text-property (point) 'vegeta-entry)))
     (unless entry (user-error "No entry at point"))
-    (puthash (plist-get entry :id) 'delete vegeta--marks)
+    (if mark
+        (puthash (plist-get entry :id) mark vegeta--marks)
+      (remhash (plist-get entry :id) vegeta--marks))
     (vegeta--redraw)
     (vegeta-next-line 1)))
+
+(defun vegeta-mark ()
+  "Mark the entry at point with `*' (dired `m'), then move down."
+  (interactive)
+  (vegeta--set-mark 'marked))
+
+(defun vegeta-mark-delete ()
+  "Flag the entry at point for deletion with `D' (dired `d'), then move down.
+Only `D'-flagged entries are removed by `vegeta-execute'."
+  (interactive)
+  (vegeta--set-mark 'delete))
 
 (defun vegeta-unmark ()
-  "Remove any mark from the entry at point."
+  "Remove any mark from the entry at point, then move down (dired `u')."
   (interactive)
-  (let ((entry (get-text-property (point) 'vegeta-entry)))
-    (unless entry (user-error "No entry at point"))
-    (remhash (plist-get entry :id) vegeta--marks)
-    (vegeta--redraw)
-    (vegeta-next-line 1)))
+  (vegeta--set-mark nil))
 
 (defun vegeta-unmark-all ()
-  "Remove all deletion marks."
+  "Remove every mark in the buffer (dired `U')."
   (interactive)
   (clrhash vegeta--marks)
   (vegeta--redraw))
@@ -1746,12 +1777,24 @@ filesystem."
   (seq-find (lambda (e) (equal id (plist-get e :id)))
             (or vegeta--entries-cache (vegeta--all-entries))))
 
+(defun vegeta--confirm-delete (n)
+  "Return non-nil when the user confirms deleting N chats.
+Always asks once, naming the count; when N exceeds
+`vegeta-delete-double-confirm-threshold' (and it is non-nil) a second,
+stronger confirmation follows."
+  (and (yes-or-no-p (format "About to delete %d chat(s).  Are you sure? " n))
+       (or (null vegeta-delete-double-confirm-threshold)
+           (<= n vegeta-delete-double-confirm-threshold)
+           (yes-or-no-p (format "Really delete %d chats?  This cannot be undone. " n)))))
+
 (defun vegeta-execute ()
-  "Delete all entries marked for deletion.
+  "Delete all entries marked for deletion, after confirmation.
 Each entry's `:delete' provider hook decides how to remove its
 storage — most providers just delete the file, but a Claude CLI
 session also cleans its sidecar `session-env/<uuid>' directory.
-Failures on individual entries are reported but don't abort the batch."
+Failures on individual entries are reported but don't abort the batch.
+Deletion always asks for confirmation, naming the count; batches larger
+than `vegeta-delete-double-confirm-threshold' ask a second time."
   (interactive)
   (let (ids)
     (maphash (lambda (id mark)
@@ -1759,7 +1802,9 @@ Failures on individual entries are reported but don't abort the batch."
              vegeta--marks)
     (cond
      ((null ids) (message "No marks to execute"))
-     ((yes-or-no-p (format "Delete %d chat(s)? " (length ids)))
+     ((not (vegeta--confirm-delete (length ids)))
+      (message "Not deleting %d chat(s)" (length ids)))
+     (t
       (let ((ok 0) (fail 0))
         (dolist (id ids)
           (let* ((entry (vegeta--entry-by-id id))
@@ -1854,41 +1899,104 @@ being opened."
           (recenter)))
     (user-error "Not a FILE:LINE match: %S" cand)))
 
+(defun vegeta--search-directory (host)
+  "Return the fzfa `:directory' that targets HOST.
+A local directory for localhost; the Tramp root (`/ssh:HOST:/') for a
+remote host, so `fzfa-tramp' ssh-wraps the command on that machine."
+  (if (vegeta--local-host-p host)
+      default-directory
+    (concat (vegeta--host-tramp-prefix host) "/")))
+
+(defun vegeta--search-source (host provider scope targets)
+  "Build an fzfa source for PROVIDER on HOST, or nil.
+TARGETS, when non-nil, restricts the search to those native paths (the
+marked chats); nil lets the provider search its default roots.  The
+source carries its own `:action' so a multi-source selection visits the
+right host."
+  (when (plist-get provider :search-command)
+    (when-let* ((cmd (funcall (plist-get provider :search-command)
+                              host scope targets)))
+      (list :name (format "%s · %s" host
+                          (or (plist-get provider :name)
+                              (symbol-name (plist-get provider :id))))
+            :command cmd
+            :directory (vegeta--search-directory host)
+            :action (lambda (cand) (vegeta--search-visit host cand))))))
+
+(defun vegeta--marked-entries ()
+  "Return the entries currently marked in this buffer, or nil."
+  (when (and (hash-table-p vegeta--marks)
+             (> (hash-table-count vegeta--marks) 0))
+    (seq-filter (lambda (e) (gethash (plist-get e :id) vegeta--marks))
+                (or vegeta--entries-cache (vegeta--all-entries)))))
+
+(defun vegeta--search-sources-for-host (host scope)
+  "Return fzfa sources for every searchable provider on HOST."
+  (let ((spec (cdr (assoc host (vegeta--hosts)))))
+    (delq nil
+          (mapcar (lambda (p) (vegeta--search-source host p scope nil))
+                  (vegeta--providers-for-host (or spec 'all))))))
+
+(defun vegeta--search-sources-for-marked (entries scope)
+  "Return fzfa sources for marked ENTRIES, one per (host, provider).
+Each source searches only its own marked files, so marks spread across
+hosts or providers become independent `fzfa' sources."
+  (let ((groups (make-hash-table :test 'equal))
+        (order nil))
+    (dolist (e entries)
+      (let ((key (cons (vegeta--entry-host e) (plist-get e :provider))))
+        (unless (gethash key groups) (push key order))
+        (puthash key (cons e (gethash key groups)) groups)))
+    (delq nil
+          (mapcar
+           (lambda (key)
+             (let* ((host (car key))
+                    (provider (alist-get (cdr key) vegeta-providers))
+                    (targets (mapcar (lambda (e)
+                                       (vegeta--unhostify host (plist-get e :id)))
+                                     (nreverse (gethash key groups)))))
+               (vegeta--search-source host provider scope targets)))
+           (nreverse order)))))
+
+(defun vegeta--run-search (sources scope)
+  "Run fzfa over SOURCES; a single source inline, several via multi-read."
+  (if (null (cdr sources))
+      (let ((s (car sources)))
+        (when-let* ((cand (fzfa-completing-read
+                           :prompt (format "Search [%s]: " scope)
+                           :command (plist-get s :command)
+                           :directory (plist-get s :directory)
+                           :category 'fzfa-grep
+                           :skip-executable-check t)))
+          (funcall (plist-get s :action) cand)))
+    (when (fboundp 'fzfa--ensure-setup) (fzfa--ensure-setup))
+    (when (fboundp 'fzfa--multi-allocate-narrow-keys)
+      (setq sources (fzfa--multi-allocate-narrow-keys sources)))
+    (fzfa--read sources :prompt (format "Search [%s]: " scope))))
+
 ;;;###autoload
 (defun vegeta-search (&optional host scope)
   "Fuzzy full-text search across chat transcripts.
-SCOPE (default `vegeta-search-scope') selects which sections are
-searched and is passed to each provider's `:search-command'; with a
-prefix argument, prompt for it.  Each provider that declares a
-`:search-command' supplies its own script, sent to HOST and streamed
-through `fzfa' (a locally spawned command for localhost; a remote-shell
-payload for a remote host via `fzfa-tramp').  With no HOST, prompt for
-one of `vegeta-hosts'."
+With no entries marked, searches HOST's providers over their default
+roots, prompting for HOST when it is nil.  With entries marked, searches
+only those marked chats — one `fzfa' source per (host, provider), so
+marks spread across machines or providers stay separate.  SCOPE
+\(default `vegeta-search-scope') selects which sections are searched;
+with a prefix argument, prompt for it."
   (interactive
    (list nil (when current-prefix-arg (vegeta--read-scope))))
   (unless (require 'fzfa nil t)
     (user-error "vegeta-search requires the `fzfa' package"))
-  (let* ((host (or host (vegeta--read-host)))
-         (scope (or scope vegeta-search-scope))
-         (spec (cdr (assoc host (vegeta--hosts))))
-         (providers (seq-filter (lambda (p) (plist-get p :search-command))
-                                (vegeta--providers-for-host (or spec 'all))))
-         (commands (delq nil
-                         (mapcar (lambda (p)
-                                   (funcall (plist-get p :search-command)
-                                            host scope))
-                                 providers))))
-    (when (null commands)
-      (user-error "No provider on %s supports full-text search" host))
-    (when-let* ((cand (fzfa-completing-read
-                       :prompt (format "Search %s [%s]: " host scope)
-                       :command (mapconcat #'identity commands " ; ")
-                       :directory (if (vegeta--local-host-p host)
-                                      default-directory
-                                    (concat (vegeta--host-tramp-prefix host) "/"))
-                       :category 'fzfa-grep
-                       :skip-executable-check t)))
-      (vegeta--search-visit host cand))))
+  (let* ((scope (or scope vegeta-search-scope))
+         (marked (vegeta--marked-entries))
+         (sources (if marked
+                      (vegeta--search-sources-for-marked marked scope)
+                    (vegeta--search-sources-for-host
+                     (or host (vegeta--read-host)) scope))))
+    (when (null sources)
+      (user-error "Nothing to search%s"
+                  (if marked " among the marked chats" "")))
+    (vegeta--run-search sources scope)))
 
 ;;;###autoload
 (defun vegeta-search-user (&optional host)
@@ -2008,6 +2116,7 @@ registry, so parsing done in one is immediately visible in the other."
       (kbd "j")   #'vegeta-next-line
       (kbd "k")   #'vegeta-previous-line
       (kbd "d")   #'vegeta-mark-delete
+      (kbd "m")   #'vegeta-mark
       (kbd "u")   #'vegeta-unmark
       (kbd "U")   #'vegeta-unmark-all
       (kbd "x")   #'vegeta-execute

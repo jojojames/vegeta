@@ -320,7 +320,7 @@ except Exception:
     pass
 
 scope = sys.argv[1] if len(sys.argv) > 1 else 'content'
-roots = sys.argv[2:]
+targets = sys.argv[2:]
 
 want = {
     'user': ('user',),
@@ -369,20 +369,29 @@ def scan(path):
     finally:
         fh.close()
 
-for root in roots:
-    base = os.path.join(root, '.agent-shell', 'transcripts')
-    for path in sorted(glob.glob(os.path.join(base, '*.md'))):
+def files_for(t):
+    if os.path.isdir(t):
+        base = os.path.join(t, '.agent-shell', 'transcripts')
+        return glob.glob(os.path.join(base, '*.md'))
+    if os.path.isfile(t):
+        return [t]
+    return []
+
+for t in targets:
+    for path in sorted(files_for(t)):
         scan(path)
 "
   "Python helper that streams searchable agent-shell transcript lines.
 It is structural: it tracks the current `## User' / `## Agent' /
 `## Agent's Thoughts' section and any `### Tool Call' (or `**Tool:**')
 block, then emits only the requested kinds.  SCOPE comes from argv[1]
-\(user / agent / content = user+agent / thoughts / all), roots follow
-as argv[2:].  Tool-call bodies, file paths, command output and compile
-logs are therefore excluded for the default `content' scope.  Inlined
-by `vegeta--agent-shell-search-command' so it runs unchanged locally
-and, wrapped by `fzfa-tramp', over ssh on a remote host.")
+\(user / agent / content = user+agent / thoughts / all); the remaining
+argv are TARGETS, each a project root (its `.agent-shell/transcripts'
+is scanned) or a transcript file (read directly) — so a search can be
+narrowed to specific marked chats.  Tool-call bodies, file paths,
+command output and compile logs are excluded for the default `content'
+scope.  Inlined by `vegeta--agent-shell-search-command' so it runs
+unchanged locally and, wrapped by `fzfa-tramp', over ssh on a host.")
 
 (defun vegeta--agent-shell--search-roots (host)
   "Return native (HOST-side) project roots to search for agent-shell."
@@ -401,23 +410,23 @@ only its basename is used and the host's PATH resolves it."
         python
       (file-name-nondirectory python))))
 
-(defun vegeta--agent-shell-search-command (host scope)
+(defun vegeta--agent-shell-search-command (host scope targets)
   "Return a shell command that streams agent-shell matches on HOST.
-SCOPE selects which transcript sections are emitted (`user', `agent',
-`content', `thoughts' or `all').  The Python helper is inlined via
-`python3 -c' (not a temp file) so it works locally and, ssh-wrapped by
-`fzfa-tramp', on a remote host; roots are native host paths and the
-interpreter is named so the host's PATH resolves it."
-  (let ((roots (vegeta--agent-shell--search-roots host))
+TARGETS, when non-nil, is a list of native (host-side) paths to search —
+transcript files or project roots; nil falls back to the host's project
+roots.  SCOPE selects which transcript sections are emitted (`user',
+`agent', `content', `thoughts' or `all').  The Python helper is inlined
+via `python3 -c' (not a temp file) so it works locally and, ssh-wrapped
+by `fzfa-tramp', on a remote host; the interpreter is named so the
+host's PATH resolves it."
+  (let ((paths (or targets (vegeta--agent-shell--search-roots host)))
         (python (vegeta--agent-shell-search-python-for host)))
-    (when python
+    (when (and python paths)
       (format "%s -c %s %s%s"
               (shell-quote-argument python)
               (shell-quote-argument vegeta--agent-shell-search-py)
               (shell-quote-argument (format "%s" (or scope 'content)))
-              (if roots
-                  (concat " " (mapconcat #'shell-quote-argument roots " "))
-                "")))))
+              (concat " " (mapconcat #'shell-quote-argument paths " "))))))
 
 ;;; Registration
 
