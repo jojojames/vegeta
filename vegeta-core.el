@@ -166,6 +166,15 @@ user can see the chat has continued past its opening prompt.  Set to
 nil to always hide the suffix."
   :type '(choice (const :tag "Disabled" nil) integer))
 
+(defcustom vegeta-max-line-width 80
+  "Maximum characters per rendered chat row.
+Entry titles are truncated with an ellipsis so the whole row (indent +
+mark + date + optional update suffix + title) fits in this many
+columns.  Set to nil to disable truncation and rely on
+`truncate-lines' for horizontal clipping."
+  :type '(choice (const :tag "Unlimited (rely on truncate-lines)" nil)
+                 integer))
+
 ;;; Faces
 
 (defface vegeta-package-face
@@ -930,6 +939,20 @@ ENTRIES-AT-NODE is the flat list of entries below this node."
        vegeta-collapsed ,collapsed))
     (insert "\n")))
 
+(defun vegeta--truncate-title (title prefix-width)
+  "Truncate TITLE so PREFIX-WIDTH + its length fits `vegeta-max-line-width'.
+Returns TITLE unchanged when the limit is disabled or the title already
+fits.  Uses `truncate-string-to-width' with an ellipsis so multi-byte
+characters are counted correctly."
+  (if (or (null title)
+          (null vegeta-max-line-width)
+          (<= (+ prefix-width (string-width title))
+              vegeta-max-line-width))
+      title
+    (truncate-string-to-width
+     title (max 1 (- vegeta-max-line-width prefix-width))
+     nil nil "…")))
+
 (defun vegeta--render-entry-row (entry depth mark)
   "Insert one chat row for ENTRY at DEPTH with optional MARK."
   (let* ((parsed (not (null (vegeta--cached-meta entry))))
@@ -953,6 +976,15 @@ ENTRIES-AT-NODE is the flat list of entries below this node."
                        (propertize "D" 'face 'vegeta-mark-face)
                      " "))
          (indent (make-string (+ 2 (* 2 depth)) ?\s))
+         ;; Everything except the title itself contributes to the
+         ;; prefix width used by `vegeta--truncate-title'.  Include
+         ;; the `: ' separator we add before the title below.
+         (prefix-width (+ (length indent) 1 1
+                          (string-width date-str)
+                          (if updated-suffix
+                              (string-width updated-suffix) 0)
+                          2))
+         (title (vegeta--truncate-title title prefix-width))
          (start (point)))
     (insert indent mark-str " " date
             (or updated-suffix "")
