@@ -260,8 +260,9 @@ CONTENT is a string, or a list of `{:type ... :text ...}' maps."
          (ms (plist-get rec :created-at))
          (text (vegeta--eca-content-text (plist-get rec :content)))
          (stamp (if (numberp ms)
-                    (format-time-string "%Y-%m-%d %H:%M"
-                                        (seconds-to-time (/ ms 1000.0)))
+                    (format-time-string
+                     (concat "%Y-%m-%d " vegeta-time-format)
+                     (seconds-to-time (/ ms 1000.0)))
                   "")))
     (insert (propertize (format "%-14s %s\n" role stamp)
                         'face 'vegeta-agent-face))

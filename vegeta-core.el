@@ -144,7 +144,11 @@ Each element is one of the recognized levels:
   `package' — group by provider (e.g. agent-shell, Claude CLI)
   `repo'    — group by project/repository root
   `model'   — group by agent/model name (Claude, Codex, ...)
-  `date'    — group by YYYY-MM-DD (from parsed timestamp or file mtime)
+  `date'    — group by date (from parsed timestamp or file mtime).  A
+              relative, adaptive hierarchy: a year section appears only
+              when entries span multiple years, a month section only for
+              multiple months, and recent days show as Today / Yesterday
+              / `N days ago'
 
 An empty list produces a flat listing sorted by date."
   :type '(repeat (choice (const host)
@@ -152,6 +156,25 @@ An empty list produces a flat listing sorted by date."
                          (const repo)
                          (const model)
                          (const date))))
+
+(defcustom vegeta-date-granularity 'days
+  "Leaf granularity for the `date' grouping level.
+`days'  — one section per day; recent days are labelled Today,
+          Yesterday, `N days ago'.
+`weeks' — one section per week (This week / Last week / N weeks ago);
+          each row then shows its own day.
+The year and month sections above the leaf are added automatically only
+when the entries actually span more than one of them."
+  :type '(choice (const :tag "Days" days) (const :tag "Weeks" weeks))
+  :group 'vegeta)
+
+(defcustom vegeta-time-format "%-I:%M %p"
+  "Time format used for entry rows and `(updated ...)' suffixes.
+Default is a 12-hour clock with a space before AM/PM, e.g. \"10:59 PM\";
+set to \"%H:%M\" for a 24-hour clock, or \"%l:%M %p\" for a
+space-padded hour."
+  :type 'string
+  :group 'vegeta)
 
 (defcustom vegeta-enabled-providers
   '(agent-shell claude-cli antigravity-cli antigravity eca)
@@ -314,6 +337,12 @@ re-scan the filesystem on every chunk.")
 Bound to the target host while a provider's hooks run so file paths
 resolve locally or over Tramp, and read by `vegeta--launch-terminal'
 to decide between a local and an ssh session.")
+
+(defvar vegeta--date-levels nil
+  "Adaptive `date' sublevels in effect for the current redraw.
+An ordered subset of `(date-year date-month date-day date-week)',
+computed from the entries' spread; consulted when labelling date
+sections and entry rows.")
 
 (defvar vegeta--async-pending 0
   "Number of async worker batches still in flight.
@@ -625,6 +654,10 @@ interactive CLIs work), starting in DIRECTORY."
 ;;   :open-transcript (ENTRY) -> buffer of a rendered transcript       (optional)
 ;;                 used by `vegeta-open-transcript' before falling
 ;;                 back to opening the entry's `:id' file
+;;   :open-search-result (ENTRY) -> buffer for a full-text search hit  (optional)
+;;                 defaults to `:open-transcript'; lets a provider whose
+;;                 storage isn't line-addressable (e.g. ECA's Transit
+;;                 files) open a search match as the readable chat
 ;;   :search-command (HOST SCOPE TARGETS) -> shell command string      (optional)
 ;;                 full-text search; the string is streamed by `fzfa'
 ;;                 (spawned locally for localhost, ssh-wrapped for a
@@ -1159,27 +1192,26 @@ back to the filesystem mtime already carried on the entry."
 
 (defun vegeta--entry-timestamp (entry)
   "Return the display timestamp for ENTRY.
-Omits the MM-DD prefix when `date' is one of `vegeta-grouping', since
-each entry then already sits under a date section header."
+When `date' groups the tree, the section headers carry the date, so a
+row shows just its time — except under `weeks' granularity, where each
+row also shows its day (the week section does not)."
   (let* ((meta (vegeta--cached-meta entry))
          (ts (and meta (plist-get meta :started-at)))
+         (secs (or (and ts (vegeta--iso-to-seconds ts))
+                   (plist-get entry :mtime)))
          (date-grouped (memq 'date vegeta-grouping)))
     (cond
-     ((and ts (string-match
-               "\\`\\([0-9]\\{4\\}\\)-\\([0-9]\\{2\\}\\)-\\([0-9]\\{2\\}\\)[T ]\\([0-9]\\{2\\}\\):\\([0-9]\\{2\\}\\)"
-               ts))
-      (if date-grouped
-          (format "%s:%s" (match-string 4 ts) (match-string 5 ts))
-        (format "%s-%s %s:%s"
-                (match-string 2 ts) (match-string 3 ts)
-                (match-string 4 ts) (match-string 5 ts))))
+     ((null secs)
+      (if date-grouped "??:??" "??-?? ??:??"))
+     ((null date-grouped)
+      (format-time-string (concat "%m-%d " vegeta-time-format)
+                          (seconds-to-time secs)))
      (t
-      (let ((mtime (plist-get entry :mtime)))
-        (if mtime
-            (format-time-string
-             (if date-grouped "%H:%M" "%m-%d %H:%M")
-             (seconds-to-time mtime))
-          (if date-grouped "??:??" "??-?? ??:??")))))))
+      (format-time-string
+       (if (vegeta--date-sectioned-p 'date-day)
+           vegeta-time-format
+         (concat "%d " vegeta-time-format))
+       (seconds-to-time secs))))))
 
 ;;; Grouping engine
 
@@ -1212,6 +1244,84 @@ groups as background parsing completes."
                             (or fn #'vegeta--default-date-key)
                             entry)))
 
+(defun vegeta--date-key-date-p (key)
+  "Return non-nil when KEY is a full YYYY-MM-DD date string."
+  (and (stringp key)
+       (string-match-p "\\`[0-9]\\{4\\}-[0-9]\\{2\\}-[0-9]\\{2\\}\\'" key)))
+
+(defun vegeta--days-ago (key)
+  "Return whole days from date KEY (YYYY-MM-DD) to today, or nil."
+  (when (vegeta--date-key-date-p key)
+    (condition-case nil
+        (- (time-to-days (current-time))
+           (time-to-days (date-to-time (concat key " 12:00:00"))))
+      (error nil))))
+
+(defun vegeta--weeks-ago (key)
+  "Return whole weeks from date KEY to the current week, or nil."
+  (let ((days (vegeta--days-ago key)))
+    (when days (floor days 7))))
+
+(defun vegeta--entry-week-key (entry)
+  "Return the Monday (YYYY-MM-DD) of ENTRY's week, or \"unknown\".
+Using the Monday date keeps week sections sortable and lets
+`vegeta--weeks-ago' work on them directly."
+  (let ((key (vegeta--entry-date-key entry)))
+    (if (vegeta--date-key-date-p key)
+        (let* ((time (date-to-time (concat key " 12:00:00")))
+               (dow (string-to-number (format-time-string "%u" time))))
+          (format-time-string "%Y-%m-%d" (time-add time (* (- 1 dow) 86400))))
+      "unknown")))
+
+(defun vegeta--date-sectioned-p (level)
+  "Return non-nil when date LEVEL is active for the current redraw."
+  (memq level vegeta--date-levels))
+
+(defun vegeta--date-sublevels (entries)
+  "Return the adaptive date sublevels for ENTRIES.
+A `date-year' and/or `date-month' level is added only when the entries
+span more than one year/month; the leaf is `date-day' or `date-week'
+per `vegeta-date-granularity'."
+  (let* ((keys (delq nil
+                     (mapcar (lambda (e)
+                               (let ((k (vegeta--entry-date-key e)))
+                                 (and (vegeta--date-key-date-p k) k)))
+                             entries)))
+         (years (delete-dups (mapcar (lambda (k) (substring k 0 4)) keys)))
+         (months (delete-dups (mapcar (lambda (k) (substring k 0 7)) keys))))
+    (append (when (> (length years) 1) '(date-year))
+            (when (> (length months) 1) '(date-month))
+            (list (if (eq vegeta-date-granularity 'weeks)
+                      'date-week
+                    'date-day)))))
+
+(defun vegeta--expand-date-levels (levels entries)
+  "Replace any `date' element of LEVELS with the sublevels for ENTRIES."
+  (mapcan (lambda (l)
+            (if (eq l 'date) (vegeta--date-sublevels entries) (list l)))
+          levels))
+
+(defun vegeta--date-day-label (key)
+  "Return the section label for a `date-day' KEY.
+Recent days are relative; older days are just the day number, since the
+year/month are carried by ancestor sections or the row timestamp."
+  (let ((days (vegeta--days-ago key)))
+    (cond
+     ((null days) (format "%s" key))
+     ((= days 0) "Today")
+     ((= days 1) "Yesterday")
+     ((<= days 6) (format "%d days ago" days))
+     (t (substring key 8 10)))))
+
+(defun vegeta--date-week-label (key)
+  "Return the section label for a `date-week' KEY."
+  (let ((weeks (vegeta--weeks-ago key)))
+    (cond
+     ((null weeks) (format "%s" key))
+     ((= weeks 0) "This week")
+     ((= weeks 1) "Last week")
+     (t (format "%d weeks ago" weeks)))))
+
 (defun vegeta--group-key (entry level)
   "Return the group key for ENTRY at LEVEL (a symbol)."
   (pcase level
@@ -1220,6 +1330,12 @@ groups as background parsing completes."
     ('repo    (or (plist-get entry :repo) "(no repo)"))
     ('model   (or (vegeta--entry-agent entry) "?"))
     ('date    (vegeta--entry-date-key entry))
+    ('date-year (let ((k (vegeta--entry-date-key entry)))
+                  (if (vegeta--date-key-date-p k) (substring k 0 4) "unknown")))
+    ('date-month (let ((k (vegeta--entry-date-key entry)))
+                   (if (vegeta--date-key-date-p k) (substring k 0 7) "unknown")))
+    ('date-day (or (vegeta--entry-date-key entry) "unknown"))
+    ('date-week (vegeta--entry-week-key entry))
     (_ nil)))
 
 (defun vegeta--provider-levels (provider-id default-levels)
@@ -1294,23 +1410,27 @@ Node shape: (:level LEVEL :key KEY :breadcrumb (KEYS...)
 
 (defun vegeta--date-sort-lessp (a b)
   "Return non-nil when date node A sorts before date node B.
-Dates are newest first; a non-date key (e.g. \"unknown\") sorts last."
-  (let ((re "\\`[0-9]\\{4\\}-[0-9]\\{2\\}-[0-9]\\{2\\}\\'")
-        (ka (format "%s" (plist-get a :key)))
-        (kb (format "%s" (plist-get b :key))))
+Newest first; a non-date key (e.g. \"unknown\") sorts last.  Works for
+year (\"2026\"), month (\"2026-09\"), day (\"2026-09-10\") and week
+\(\"2026-W37\") keys, which are all lexicographically chronological."
+  (let* ((ka (format "%s" (plist-get a :key)))
+         (kb (format "%s" (plist-get b :key)))
+         (da (string-match-p "\\`[0-9]\\{4\\}" ka))
+         (db (string-match-p "\\`[0-9]\\{4\\}" kb)))
     (cond
-     ((and (string-match-p re ka) (string-match-p re kb)) (string> ka kb))
-     ((string-match-p re ka) t)
-     ((string-match-p re kb) nil)
+     ((and da db) (string> ka kb))
+     (da t)
+     (db nil)
      (t (string< ka kb)))))
 
 (defun vegeta--node-sort-lessp (a b)
   "Return non-nil when node A sorts before sibling node B.
 Sections are alphabetical, with two exceptions: `localhost' leads the
-`host' level, and `date' sections are newest first."
+`host' level, and date sections are newest first."
   (pcase (plist-get a :level)
     ('host (vegeta--host-sort-lessp a b))
-    ('date (vegeta--date-sort-lessp a b))
+    ((or 'date 'date-year 'date-month 'date-day 'date-week)
+     (vegeta--date-sort-lessp a b))
     (_     (string< (vegeta--node-sort-key a) (vegeta--node-sort-key b)))))
 
 ;;; Rendering
@@ -1335,6 +1455,17 @@ Sections are alphabetical, with two exceptions: `localhost' leads the
            (file-name-nondirectory (directory-file-name key)))))
     ('model (or key "?"))
     ('date (or key "unknown"))
+    ('date-year (if (equal key (format-time-string "%Y"))
+                    "This year"
+                  (format "%s" key)))
+    ('date-month
+     (if (equal key (format-time-string "%Y-%m"))
+         "This month"
+       (condition-case nil
+           (format-time-string "%B" (date-to-time (concat key "-01 12:00:00")))
+         (error (format "%s" key)))))
+    ('date-day (vegeta--date-day-label key))
+    ('date-week (vegeta--date-week-label key))
     (_ (format "%s" key))))
 
 (defun vegeta--face-for-level (level)
@@ -1344,7 +1475,7 @@ Sections are alphabetical, with two exceptions: `localhost' leads the
     ('package 'vegeta-package-face)
     ('repo    'vegeta-project-face)
     ('model   'vegeta-agent-face)
-    ('date    'vegeta-date-face)
+    ((or 'date 'date-year 'date-month 'date-day 'date-week) 'vegeta-date-face)
     (_        'vegeta-project-face)))
 
 (defun vegeta--effective-levels (levels)
@@ -1430,8 +1561,9 @@ with an ellipsis so multi-byte characters are counted correctly."
                started updated
                (> (- updated started) vegeta-updated-suffix-min-delta)
                (propertize
-                (format-time-string " (updated %m-%d %H:%M)"
-                                    (seconds-to-time updated))
+                (format-time-string
+                 (concat " (updated %m-%d " vegeta-time-format ")")
+                 (seconds-to-time updated))
                 'face 'vegeta-updated-face)))
          (mark-str (vegeta--mark-string mark))
          (indent (make-string (+ 2 (* 2 depth)) ?\s))
@@ -1533,9 +1665,15 @@ with an ellipsis so multi-byte characters are counted correctly."
             (vegeta--render-entry-row
              e 0 (gethash (plist-get e :id) vegeta--marks)))))
        (t
-        (vegeta--render-tree
-         (vegeta--build-tree entries (vegeta--effective-levels vegeta-grouping))
-         0)))
+        (let* ((levels (vegeta--effective-levels vegeta-grouping))
+               (date-p (memq 'date levels)))
+          (setq vegeta--date-levels
+                (and date-p (vegeta--date-sublevels entries)))
+          (vegeta--render-tree
+           (vegeta--build-tree
+            entries
+            (if date-p (vegeta--expand-date-levels levels entries) levels))
+           0))))
       (goto-char (point-min))
       (cond
        (prev-entry-id
@@ -1887,16 +2025,26 @@ Providers translate this to their own storage."
     (completing-read "Host: " hosts nil t nil nil (car hosts))))
 
 (defun vegeta--search-visit (host cand)
-  "Open CAND (a FILE:LINE:TEXT match from HOST) at its line.
-FILE is host-native, so it is tramp-qualified for a remote HOST before
-being opened."
+  "Open CAND, a FILE:LINE:TEXT search match from HOST.
+FILE is host-native, so it is tramp-qualified for a remote HOST.  When
+FILE maps back to a known entry whose provider offers `:open-search-result'
+\(or `:open-transcript') — e.g. ECA, whose storage is opaque Transit
+rather than a line-addressable file — that renderer is used, so the match
+opens the readable chat instead of the raw source.  Otherwise the file is
+opened at the match's line."
   (if (string-match "\\`\\(.+?\\):\\([0-9]+\\):" cand)
-      (let ((file (vegeta--hostify host (match-string 1 cand)))
-            (line (string-to-number (match-string 2 cand))))
-        (with-current-buffer (find-file-noselect file)
-          (goto-char (point-min))
-          (forward-line (1- (max 1 line)))
-          (recenter)))
+      (let* ((file (vegeta--hostify host (match-string 1 cand)))
+             (line (string-to-number (match-string 2 cand)))
+             (entry (vegeta--entry-by-id file))
+             (provider (and entry (vegeta--entry-provider entry)))
+             (opener (and provider (or (plist-get provider :open-search-result)
+                                       (plist-get provider :open-transcript)))))
+        (if opener
+            (vegeta--pop-to (funcall opener entry))
+          (with-current-buffer (find-file-noselect file)
+            (goto-char (point-min))
+            (forward-line (1- (max 1 line)))
+            (recenter))))
     (user-error "Not a FILE:LINE match: %S" cand)))
 
 (defun vegeta--search-directory (host)
